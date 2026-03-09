@@ -1,0 +1,44 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+.venv
+venv
+env
+
+# Runtime data (generated during analysis)
+frames/
+annotated/
+detections/
+faces/
+persons/
+face_crops/
+videos/*.mp4
+videos/*.avi
+videos/*.mov
+
+# Training artifacts
+runs/
+dataset/
+yolo_dataset/
+prepare_yolo_dataset.py
+train_yolo.py
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# Docker
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Docs
+*.md

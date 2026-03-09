@@ -1,0 +1,15 @@
+version: "3.8"
+
+services:
+  loco-pilot-monitor:
+    build: .
+    container_name: loco-pilot-monitor
+    ports:
+      - "8000:8000"
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+    volumes:
+      # Persist uploaded videos and analysis outputs
+      - ./videos:/app/videos
+      - ./detections:/app/detections
+    restart: unless-stopped

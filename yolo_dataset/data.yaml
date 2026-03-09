@@ -1,0 +1,10 @@
+# YOLOv8 Dataset Configuration
+# Brake & Horn Detection for Loco Pilot Analysis
+
+path: C:\Users\ADMIN\Downloads\loco_pilot_analysis\yolo_dataset
+train: train/images
+val: val/images
+
+# Classes (Option C - renamed)
+nc: 4
+names: ['horn_active', 'horn_inactive', 'brake_applied', 'brake_released']

@@ -1,0 +1,1287 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Crew Behavior Monitoring Report</title>
+    <meta name="description" content="AI-powered safety analysis for locomotive cab CCTV footage">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap"
+        rel="stylesheet">
+
+    <style>
+        :root {
+            --bg-primary: #06080f;
+            --bg-secondary: #0d1120;
+            --bg-card: rgba(15, 20, 40, 0.7);
+            --bg-card-hover: rgba(20, 28, 55, 0.8);
+            --bg-glass: rgba(255, 255, 255, 0.03);
+            --border-subtle: rgba(255, 255, 255, 0.06);
+            --border-glow: rgba(99, 140, 255, 0.15);
+            --text-primary: #e8ecf4;
+            --text-secondary: #8b95b0;
+            --text-muted: #4a5370;
+            --accent-primary: #638cff;
+            --accent-secondary: #a78bfa;
+            --accent-gradient: linear-gradient(135deg, #638cff 0%, #a78bfa 50%, #f472b6 100%);
+            --status-red: #f87171;
+            --status-red-bg: rgba(248, 113, 113, 0.08);
+            --status-red-border: rgba(248, 113, 113, 0.2);
+            --status-orange: #fbbf24;
+            --status-orange-bg: rgba(251, 191, 36, 0.08);
+            --status-orange-border: rgba(251, 191, 36, 0.2);
+            --status-green: #34d399;
+            --status-green-bg: rgba(52, 211, 153, 0.08);
+            --status-green-border: rgba(52, 211, 153, 0.2);
+            --status-blue: #60a5fa;
+            --status-blue-bg: rgba(96, 165, 250, 0.08);
+            --status-blue-border: rgba(96, 165, 250, 0.2);
+            --status-purple: #c084fc;
+            --status-purple-bg: rgba(192, 132, 252, 0.08);
+            --radius-sm: 8px;
+            --radius-md: 14px;
+            --radius-lg: 20px;
+            --shadow-card: 0 4px 24px rgba(0, 0, 0, 0.3), 0 0 0 1px var(--border-subtle);
+            --shadow-glow: 0 0 40px rgba(99, 140, 255, 0.06);
+            --transition: 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            min-height: 100vh;
+            overflow-x: hidden;
+        }
+
+        body::before {
+            content: '';
+            position: fixed;
+            top: -50%;
+            left: -50%;
+            width: 200%;
+            height: 200%;
+            background: radial-gradient(ellipse at 30% 20%, rgba(99, 140, 255, 0.04) 0%, transparent 50%),
+                radial-gradient(ellipse at 70% 80%, rgba(167, 139, 250, 0.03) 0%, transparent 50%);
+            pointer-events: none;
+            z-index: 0;
+        }
+
+        .container {
+            position: relative;
+            z-index: 1;
+            max-width: 1080px;
+            margin: 0 auto;
+            padding: 32px 24px;
+        }
+
+        /* ===== UPLOAD PAGE ===== */
+        .upload-container {
+            max-width: 580px;
+            margin: 60px auto;
+            text-align: center;
+        }
+
+        .upload-logo {
+            font-size: 56px;
+            margin-bottom: 16px;
+            filter: drop-shadow(0 0 20px rgba(99, 140, 255, 0.3));
+        }
+
+        .upload-container h1 {
+            font-size: 32px;
+            font-weight: 900;
+            background: var(--accent-gradient);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            margin-bottom: 8px;
+            letter-spacing: -0.5px;
+        }
+
+        .upload-container .subtitle {
+            font-size: 15px;
+            color: var(--text-secondary);
+            margin-bottom: 32px;
+            font-weight: 400;
+        }
+
+        .feature-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 8px;
+            margin-bottom: 32px;
+        }
+
+        .feature-chip {
+            font-size: 11px;
+            font-weight: 600;
+            padding: 8px 10px;
+            border-radius: var(--radius-sm);
+            background: var(--bg-glass);
+            border: 1px solid var(--border-subtle);
+            color: var(--text-secondary);
+            transition: var(--transition);
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            justify-content: center;
+        }
+
+        .feature-chip:hover {
+            border-color: var(--border-glow);
+            background: rgba(99, 140, 255, 0.05);
+            transform: translateY(-1px);
+        }
+
+        .upload-card {
+            background: var(--bg-card);
+            backdrop-filter: blur(20px);
+            border: 1px solid var(--border-subtle);
+            border-radius: var(--radius-lg);
+            padding: 40px 32px;
+            box-shadow: var(--shadow-card);
+        }
+
+        .drop-zone {
+            border: 2px dashed rgba(99, 140, 255, 0.2);
+            border-radius: var(--radius-md);
+            padding: 48px 24px;
+            transition: var(--transition);
+            cursor: pointer;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .drop-zone::before {
+            content: '';
+            position: absolute;
+            inset: 0;
+            background: radial-gradient(circle at center, rgba(99, 140, 255, 0.04) 0%, transparent 70%);
+            opacity: 0;
+            transition: var(--transition);
+        }
+
+        .drop-zone:hover::before,
+        .drop-zone.drag-over::before {
+            opacity: 1;
+        }
+
+        .drop-zone:hover,
+        .drop-zone.drag-over {
+            border-color: var(--accent-primary);
+            transform: scale(1.01);
+        }
+
+        .drop-zone .icon {
+            font-size: 44px;
+            margin-bottom: 14px;
+            filter: drop-shadow(0 4px 12px rgba(99, 140, 255, 0.2));
+        }
+
+        .drop-zone .label {
+            font-weight: 700;
+            font-size: 16px;
+            margin-bottom: 6px;
+        }
+
+        .drop-zone .hint {
+            font-size: 12px;
+            color: var(--text-muted);
+        }
+
+        .file-name-display {
+            margin-top: 12px;
+            font-size: 13px;
+            color: var(--accent-primary);
+            font-weight: 600;
+            display: none;
+        }
+
+        input[type="file"] {
+            margin-top: 16px;
+            color: var(--text-secondary);
+            font-size: 13px;
+        }
+
+        .btn-analyze {
+            width: 100%;
+            margin-top: 24px;
+            padding: 16px;
+            border: none;
+            border-radius: var(--radius-md);
+            font-family: inherit;
+            font-size: 15px;
+            font-weight: 700;
+            color: #fff;
+            background: var(--accent-gradient);
+            cursor: pointer;
+            transition: var(--transition);
+            letter-spacing: 0.3px;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .btn-analyze::before {
+            content: '';
+            position: absolute;
+            inset: 0;
+            background: linear-gradient(135deg, transparent, rgba(255, 255, 255, 0.15), transparent);
+            transform: translateX(-100%);
+            transition: 0.6s;
+        }
+
+        .btn-analyze:hover::before {
+            transform: translateX(100%);
+        }
+
+        .btn-analyze:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 32px rgba(99, 140, 255, 0.3), 0 0 0 1px rgba(99, 140, 255, 0.2);
+        }
+
+        /* ===== REPORT PAGE ===== */
+        .report-header {
+            text-align: center;
+            padding: 40px 0 32px;
+            margin-bottom: 8px;
+        }
+
+        .report-header h1 {
+            font-size: 28px;
+            font-weight: 900;
+            background: var(--accent-gradient);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            margin-bottom: 8px;
+            letter-spacing: -0.3px;
+        }
+
+        .report-header .meta {
+            font-size: 13px;
+            color: var(--text-muted);
+        }
+
+        /* Video Info Bar */
+        .video-info-bar {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            justify-content: center;
+            margin-bottom: 32px;
+        }
+
+        .info-chip {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            background: var(--bg-card);
+            backdrop-filter: blur(12px);
+            border: 1px solid var(--border-subtle);
+            padding: 10px 18px;
+            border-radius: 100px;
+            font-size: 12px;
+            color: var(--text-secondary);
+            font-weight: 500;
+            transition: var(--transition);
+        }
+
+        .info-chip:hover {
+            border-color: var(--border-glow);
+            transform: translateY(-1px);
+        }
+
+        .info-chip strong {
+            color: var(--text-primary);
+            font-weight: 700;
+        }
+
+        /* Safety Score Summary Bar */
+        .safety-score-bar {
+            display: flex;
+            gap: 12px;
+            margin-bottom: 32px;
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+
+        .score-pill {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 16px;
+            border-radius: 100px;
+            font-size: 12px;
+            font-weight: 700;
+        }
+
+        .score-pill.critical {
+            background: var(--status-red-bg);
+            border: 1px solid var(--status-red-border);
+            color: var(--status-red);
+        }
+
+        .score-pill.warning {
+            background: var(--status-orange-bg);
+            border: 1px solid var(--status-orange-border);
+            color: var(--status-orange);
+        }
+
+        .score-pill.clear {
+            background: var(--status-green-bg);
+            border: 1px solid var(--status-green-border);
+            color: var(--status-green);
+        }
+
+        /* Parameter Cards */
+        .param-grid {
+            display: flex;
+            flex-direction: column;
+            gap: 14px;
+            margin-bottom: 32px;
+        }
+
+        .param-card {
+            background: var(--bg-card);
+            backdrop-filter: blur(20px);
+            border: 1px solid var(--border-subtle);
+            border-radius: var(--radius-md);
+            overflow: hidden;
+            transition: var(--transition);
+            box-shadow: var(--shadow-card);
+            animation: fadeSlideUp 0.5s ease forwards;
+            opacity: 0;
+        }
+
+        .param-card:nth-child(1) {
+            animation-delay: 0.05s;
+        }
+
+        .param-card:nth-child(2) {
+            animation-delay: 0.1s;
+        }
+
+        .param-card:nth-child(3) {
+            animation-delay: 0.15s;
+        }
+
+        .param-card:nth-child(4) {
+            animation-delay: 0.2s;
+        }
+
+        .param-card:nth-child(5) {
+            animation-delay: 0.25s;
+        }
+
+        .param-card:nth-child(6) {
+            animation-delay: 0.3s;
+        }
+
+        .param-card:nth-child(7) {
+            animation-delay: 0.35s;
+        }
+
+        .param-card:nth-child(8) {
+            animation-delay: 0.4s;
+        }
+
+        .param-card:nth-child(9) {
+            animation-delay: 0.45s;
+        }
+
+        @keyframes fadeSlideUp {
+            from {
+                opacity: 0;
+                transform: translateY(16px);
+            }
+
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .param-card:hover {
+            border-color: var(--border-glow);
+            box-shadow: var(--shadow-card), var(--shadow-glow);
+            transform: translateY(-2px);
+        }
+
+        .param-card.status-alert {
+            border-left: 3px solid var(--status-red);
+        }
+
+        .param-card.status-warn {
+            border-left: 3px solid var(--status-orange);
+        }
+
+        .param-card.status-ok {
+            border-left: 3px solid var(--status-green);
+        }
+
+        .param-card.status-info {
+            border-left: 3px solid var(--status-blue);
+        }
+
+        .param-card-inner {
+            display: flex;
+            gap: 0;
+        }
+
+        .param-info {
+            flex: 1;
+            padding: 22px 24px;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            min-width: 0;
+        }
+
+        .param-top-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 10px;
+            flex-wrap: wrap;
+        }
+
+        .param-number {
+            font-size: 10px;
+            font-weight: 800;
+            color: var(--text-muted);
+            background: rgba(255, 255, 255, 0.04);
+            padding: 3px 8px;
+            border-radius: 6px;
+            letter-spacing: 0.5px;
+        }
+
+        .param-icon {
+            font-size: 20px;
+            width: 36px;
+            height: 36px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 10px;
+            background: rgba(255, 255, 255, 0.03);
+            flex-shrink: 0;
+        }
+
+        .param-name {
+            font-weight: 700;
+            font-size: 15px;
+            letter-spacing: -0.2px;
+        }
+
+        .param-description {
+            font-size: 13px;
+            line-height: 1.65;
+            color: var(--text-secondary);
+            margin-top: 2px;
+        }
+
+        .param-meta {
+            display: flex;
+            gap: 16px;
+            margin-top: 12px;
+            font-size: 11px;
+            color: var(--text-muted);
+            align-items: center;
+        }
+
+        .confidence-bar {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .confidence-track {
+            width: 60px;
+            height: 4px;
+            background: rgba(255, 255, 255, 0.06);
+            border-radius: 4px;
+            overflow: hidden;
+        }
+
+        .confidence-fill {
+            height: 100%;
+            border-radius: 4px;
+            transition: width 0.8s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+
+        .confidence-fill.high {
+            width: 100%;
+            background: var(--status-green);
+        }
+
+        .confidence-fill.medium {
+            width: 60%;
+            background: var(--status-orange);
+        }
+
+        .confidence-fill.low {
+            width: 30%;
+            background: var(--status-red);
+        }
+
+        /* Status Badge */
+        .status-badge {
+            font-size: 10px;
+            font-weight: 800;
+            padding: 5px 14px;
+            border-radius: 100px;
+            letter-spacing: 0.8px;
+            text-transform: uppercase;
+            white-space: nowrap;
+        }
+
+        .status-critical {
+            background: var(--status-red-bg);
+            color: var(--status-red);
+            border: 1px solid var(--status-red-border);
+            box-shadow: 0 0 12px rgba(248, 113, 113, 0.1);
+        }
+
+        .status-warning {
+            background: var(--status-orange-bg);
+            color: var(--status-orange);
+            border: 1px solid var(--status-orange-border);
+        }
+
+        .status-observed {
+            background: var(--status-blue-bg);
+            color: var(--status-blue);
+            border: 1px solid var(--status-blue-border);
+        }
+
+        .status-clear {
+            background: var(--status-green-bg);
+            color: var(--status-green);
+            border: 1px solid var(--status-green-border);
+        }
+
+        .status-unknown {
+            background: var(--status-purple-bg);
+            color: var(--status-purple);
+            border: 1px solid rgba(192, 132, 252, 0.2);
+        }
+
+        /* Evidence Image */
+        .param-evidence {
+            width: 280px;
+            min-height: 180px;
+            flex-shrink: 0;
+            background: rgba(0, 0, 0, 0.3);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-left: 1px solid var(--border-subtle);
+            position: relative;
+            overflow: hidden;
+        }
+
+        .param-evidence img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            transition: transform 0.4s ease;
+        }
+
+        .param-evidence:hover img {
+            transform: scale(1.05);
+        }
+
+        .param-evidence .no-evidence {
+            font-size: 12px;
+            color: var(--text-muted);
+            text-align: center;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .no-evidence-icon {
+            font-size: 28px;
+            opacity: 0.4;
+        }
+
+        /* Summary Sections */
+        .summary-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 14px;
+            margin-bottom: 14px;
+        }
+
+        .summary-section {
+            background: var(--bg-card);
+            backdrop-filter: blur(20px);
+            border: 1px solid var(--border-subtle);
+            border-radius: var(--radius-md);
+            padding: 24px;
+            box-shadow: var(--shadow-card);
+            transition: var(--transition);
+        }
+
+        .summary-section:hover {
+            border-color: var(--border-glow);
+        }
+
+        .summary-section.full-width {
+            grid-column: 1 / -1;
+        }
+
+        .summary-section h2 {
+            font-size: 15px;
+            font-weight: 700;
+            margin-bottom: 14px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            letter-spacing: -0.2px;
+        }
+
+        .summary-section p,
+        .summary-section ul {
+            font-size: 13px;
+            line-height: 1.75;
+            color: var(--text-secondary);
+        }
+
+        .summary-section ul {
+            padding-left: 18px;
+        }
+
+        .summary-section li {
+            margin-bottom: 6px;
+        }
+
+        .summary-section li::marker {
+            color: var(--accent-primary);
+        }
+
+        /* Action Buttons */
+        .action-bar {
+            display: flex;
+            gap: 12px;
+            justify-content: center;
+            flex-wrap: wrap;
+            margin-bottom: 20px;
+        }
+
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 13px 28px;
+            border: none;
+            border-radius: var(--radius-md);
+            font-family: inherit;
+            font-size: 13px;
+            font-weight: 700;
+            cursor: pointer;
+            transition: var(--transition);
+            text-decoration: none;
+            letter-spacing: 0.3px;
+        }
+
+        .btn-primary {
+            color: #fff;
+            background: linear-gradient(135deg, #059669, #047857);
+            box-shadow: 0 4px 16px rgba(5, 150, 105, 0.2);
+        }
+
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 28px rgba(5, 150, 105, 0.35);
+        }
+
+        .btn-secondary {
+            color: var(--accent-primary);
+            background: var(--bg-card);
+            border: 1px solid var(--border-subtle);
+        }
+
+        .btn-secondary:hover {
+            background: rgba(99, 140, 255, 0.06);
+            border-color: var(--border-glow);
+            transform: translateY(-1px);
+        }
+
+        .btn-ghost {
+            color: var(--accent-primary);
+            background: transparent;
+            font-weight: 600;
+            padding: 10px 20px;
+        }
+
+        .btn-ghost:hover {
+            background: rgba(99, 140, 255, 0.06);
+            border-radius: var(--radius-sm);
+        }
+
+        /* Raw Analysis */
+        .raw-box {
+            display: none;
+            background: rgba(0, 0, 0, 0.4);
+            border: 1px solid var(--border-subtle);
+            border-radius: var(--radius-md);
+            padding: 20px;
+            font-family: 'Consolas', 'Monaco', 'Fira Code', monospace;
+            font-size: 12px;
+            line-height: 1.7;
+            color: var(--text-secondary);
+            white-space: pre-wrap;
+            max-height: 500px;
+            overflow-y: auto;
+            margin-bottom: 24px;
+        }
+
+        .raw-box.visible {
+            display: block;
+            animation: fadeSlideUp 0.3s ease;
+        }
+
+        /* Footer */
+        .report-footer {
+            text-align: center;
+            padding: 24px 0;
+            font-size: 11px;
+            color: var(--text-muted);
+            border-top: 1px solid var(--border-subtle);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 6px;
+            flex-wrap: wrap;
+        }
+
+        .footer-dot {
+            width: 3px;
+            height: 3px;
+            border-radius: 50%;
+            background: var(--text-muted);
+        }
+
+        /* Loading Overlay */
+        .loading-overlay {
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: rgba(6, 8, 15, 0.95);
+            backdrop-filter: blur(12px);
+            z-index: 100;
+            justify-content: center;
+            align-items: center;
+            flex-direction: column;
+            gap: 24px;
+        }
+
+        .loading-overlay.active {
+            display: flex;
+        }
+
+        .loading-spinner {
+            position: relative;
+            width: 56px;
+            height: 56px;
+        }
+
+        .loading-spinner::before,
+        .loading-spinner::after {
+            content: '';
+            position: absolute;
+            inset: 0;
+            border-radius: 50%;
+            border: 3px solid transparent;
+        }
+
+        .loading-spinner::before {
+            border-top-color: var(--accent-primary);
+            animation: spin 1s linear infinite;
+        }
+
+        .loading-spinner::after {
+            inset: 6px;
+            border-bottom-color: var(--accent-secondary);
+            animation: spin 0.6s linear infinite reverse;
+        }
+
+        @keyframes spin {
+            to {
+                transform: rotate(360deg);
+            }
+        }
+
+        .loading-text {
+            font-size: 16px;
+            font-weight: 700;
+            background: var(--accent-gradient);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .loading-sub {
+            font-size: 13px;
+            color: var(--text-muted);
+            text-align: center;
+            max-width: 360px;
+            line-height: 1.5;
+        }
+
+        .loading-steps {
+            display: flex;
+            gap: 20px;
+            margin-top: 8px;
+        }
+
+        .loading-step {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 11px;
+            color: var(--text-muted);
+            font-weight: 600;
+        }
+
+        .loading-step .dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: var(--accent-primary);
+            animation: pulse 1.5s ease infinite;
+        }
+
+        .loading-step:nth-child(2) .dot {
+            animation-delay: 0.3s;
+        }
+
+        .loading-step:nth-child(3) .dot {
+            animation-delay: 0.6s;
+        }
+
+        @keyframes pulse {
+
+            0%,
+            100% {
+                opacity: 0.3;
+                transform: scale(0.8);
+            }
+
+            50% {
+                opacity: 1;
+                transform: scale(1.2);
+            }
+        }
+
+        /* Error message */
+        .error-msg {
+            margin-top: 24px;
+            padding: 16px 20px;
+            background: var(--status-red-bg);
+            border: 1px solid var(--status-red-border);
+            border-radius: var(--radius-md);
+            color: var(--status-red);
+            font-size: 13px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        /* Responsive */
+        @media (max-width: 768px) {
+            .container {
+                padding: 16px;
+            }
+
+            .param-card-inner {
+                flex-direction: column;
+            }
+
+            .param-evidence {
+                width: 100%;
+                min-height: 200px;
+                border-left: none;
+                border-top: 1px solid var(--border-subtle);
+            }
+
+            .summary-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .feature-grid {
+                grid-template-columns: repeat(2, 1fr);
+            }
+
+            .video-info-bar {
+                gap: 6px;
+            }
+
+            .info-chip {
+                padding: 6px 12px;
+                font-size: 11px;
+            }
+        }
+
+        /* Image modal for evidence zoom */
+        .image-modal {
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.9);
+            backdrop-filter: blur(8px);
+            z-index: 200;
+            justify-content: center;
+            align-items: center;
+            cursor: zoom-out;
+        }
+
+        .image-modal.active {
+            display: flex;
+        }
+
+        .image-modal img {
+            max-width: 90vw;
+            max-height: 90vh;
+            border-radius: var(--radius-md);
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+        }
+
+        /* Scrollbar styling */
+        ::-webkit-scrollbar {
+            width: 6px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: transparent;
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 3px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: rgba(255, 255, 255, 0.2);
+        }
+    </style>
+</head>
+
+<body>
+
+    <!-- Loading Overlay -->
+    <div class="loading-overlay" id="loadingOverlay">
+        <div class="loading-spinner"></div>
+        <div class="loading-text">Analyzing Video...</div>
+        <div class="loading-sub">Processing through multi-layer AI pipeline for comprehensive safety analysis</div>
+        <div class="loading-steps">
+            <div class="loading-step"><span class="dot"></span> YOLO Detection</div>
+            <div class="loading-step"><span class="dot"></span> Face Analysis</div>
+            <div class="loading-step"><span class="dot"></span> Gemini AI</div>
+        </div>
+    </div>
+
+    <!-- Image Zoom Modal -->
+    <div class="image-modal" id="imageModal" onclick="closeModal()">
+        <img id="modalImg" src="" alt="Evidence zoom">
+    </div>
+
+    <div class="container">
+
+        {% if not parameters %}
+        <!-- ==================== UPLOAD PAGE ==================== -->
+        <div class="upload-container">
+            <div class="upload-logo">🚂</div>
+            <h1>Crew Behavior Monitoring</h1>
+            <p class="subtitle">AI-powered safety analysis for locomotive cab CCTV footage</p>
+
+            <div class="feature-grid">
+                <span class="feature-chip">🧠 Alertness</span>
+                <span class="feature-chip">👀 Distraction</span>
+                <span class="feature-chip">✍️ Writing Work</span>
+                <span class="feature-chip">😴 Nap Detection</span>
+                <span class="feature-chip">📱 Mobile Usage</span>
+                <span class="feature-chip">🎒 Packing</span>
+                <span class="feature-chip">🚪 Leaving Place</span>
+                <span class="feature-chip">📯 Horn Operation</span>
+                <span class="feature-chip">🛑 Brake A9/SA9</span>
+            </div>
+
+            <div class="upload-card">
+                <form action="/analyze" method="post" enctype="multipart/form-data" id="uploadForm">
+                    <div class="drop-zone" id="dropZone">
+                        <div class="icon">📹</div>
+                        <div class="label">Upload Cab Camera Video</div>
+                        <div class="hint">Drag & drop or click to browse · MP4, AVI, MOV</div>
+                        <input type="file" name="video" accept="video/*" required id="fileInput"
+                            style="position:absolute;width:0;height:0;opacity:0;pointer-events:none;">
+                        <div class="file-name-display" id="fileName"></div>
+                    </div>
+
+                    <button type="submit" class="btn-analyze">
+                        🔍 Analyze Video for All 9 Safety Parameters
+                    </button>
+                </form>
+            </div>
+
+            {% if result and not parameters %}
+            <div class="error-msg">
+                ⚠️ {{ result }}
+            </div>
+            {% endif %}
+        </div>
+
+        {% else %}
+        <!-- ==================== REPORT PAGE ==================== -->
+
+        <!-- Report Header -->
+        <div class="report-header">
+            <h1>📋 Crew Behavior Monitoring Report</h1>
+            <div class="meta">
+                <span>Generated: {{ video_info.analysis_time }}</span>
+            </div>
+        </div>
+
+        <!-- Video Info Bar -->
+        <div class="video-info-bar">
+            <div class="info-chip">📁 <strong>{{ video_info.filename }}</strong></div>
+            <div class="info-chip">⏱ Duration: <strong>{{ video_info.duration }}s</strong></div>
+            <div class="info-chip">🎞 FPS: <strong>{{ video_info.fps }}</strong></div>
+            <div class="info-chip">📸 Frames: <strong>{{ video_info.frames_analyzed }}</strong></div>
+        </div>
+
+        <!-- Quick Status Summary -->
+        <div class="safety-score-bar">
+            {% set ns = namespace(critical=0, warning=0, clear=0) %}
+            {% for key, param in parameters.items() %}
+            {% set s = param.status|upper %}
+            {% if s in ['LOW', 'DROWSY'] or (s == 'OBSERVED' and key in ['nap', 'mobile']) %}
+            {% set ns.critical = ns.critical + 1 %}
+            {% elif s in ['MODERATE'] or (s == 'OBSERVED' and key in ['distraction', 'writing', 'packing', 'leaving'])
+            %}
+            {% set ns.warning = ns.warning + 1 %}
+            {% elif s in ['HIGH', 'NOT_OBSERVED', 'NONE'] %}
+            {% set ns.clear = ns.clear + 1 %}
+            {% endif %}
+            {% endfor %}
+            {% if ns.critical > 0 %}
+            <div class="score-pill critical">🔴 {{ ns.critical }} Critical</div>
+            {% endif %}
+            {% if ns.warning > 0 %}
+            <div class="score-pill warning">🟡 {{ ns.warning }} Warning</div>
+            {% endif %}
+            {% if ns.clear > 0 %}
+            <div class="score-pill clear">🟢 {{ ns.clear }} Clear</div>
+            {% endif %}
+        </div>
+
+        <!-- Parameter Cards -->
+        <div class="param-grid">
+
+            {% for key, param in parameters.items() %}
+            {% set s = param.status|upper %}
+            <div
+                class="param-card {% if s in ['LOW', 'DROWSY'] or (s == 'OBSERVED' and key in ['nap', 'mobile']) %}status-alert{% elif s in ['MODERATE'] or (s == 'OBSERVED' and key in ['distraction', 'writing', 'packing', 'leaving']) %}status-warn{% elif s == 'OBSERVED' %}status-info{% else %}status-ok{% endif %}">
+                <div class="param-card-inner">
+                    <div class="param-info">
+                        <div class="param-top-row">
+                            <span class="param-number">#{{ loop.index }}</span>
+                            <span class="param-icon">{{ param.icon }}</span>
+                            <span class="param-name">{{ param.label }}</span>
+
+                            <!-- Status Badge -->
+                            {% if s in ['LOW', 'DROWSY', 'DROWSY_DETECTED'] or ('nap' in key and s == 'OBSERVED') or
+                            ('mobile' in key and s == 'OBSERVED') %}
+                            <span class="status-badge status-critical">{{ param.status }}</span>
+                            {% elif s in ['MODERATE', 'HIGH'] and ('distraction' in key or 'alertness' in key) %}
+                            {% if 'distraction' in key and s == 'HIGH' %}
+                            <span class="status-badge status-critical">{{ param.status }}</span>
+                            {% elif 'alertness' in key and s == 'HIGH' %}
+                            <span class="status-badge status-clear">{{ param.status }}</span>
+                            {% else %}
+                            <span class="status-badge status-warning">{{ param.status }}</span>
+                            {% endif %}
+                            {% elif s == 'OBSERVED' %}
+                            <span class="status-badge status-observed">{{ param.status }}</span>
+                            {% elif s in ['NOT_OBSERVED', 'NONE'] %}
+                            <span class="status-badge status-clear">{{ param.status }}</span>
+                            {% elif s == 'UNABLE_TO_DETERMINE' %}
+                            <span class="status-badge status-unknown">{{ param.status }}</span>
+                            {% else %}
+                            <span class="status-badge status-warning">{{ param.status }}</span>
+                            {% endif %}
+                        </div>
+
+                        <p class="param-description">{{ param.description }}</p>
+
+                        <div class="param-meta">
+                            <div class="confidence-bar">
+                                <span>🎯 {{ param.confidence }}</span>
+                                <div class="confidence-track">
+                                    <div
+                                        class="confidence-fill {% if param.confidence|upper == 'HIGH' %}high{% elif param.confidence|upper == 'MEDIUM' %}medium{% else %}low{% endif %}">
+                                    </div>
+                                </div>
+                            </div>
+                            {% if param.timestamp and param.timestamp != 'N/A' %}
+                            <span>🕐 {{ param.timestamp }}</span>
+                            {% endif %}
+                        </div>
+                    </div>
+
+                    <!-- Evidence Image -->
+                    <div class="param-evidence">
+                        {% if param.image_url %}
+                        <img src="{{ param.image_url }}" alt="Evidence for {{ param.label }}"
+                            onclick="openModal(this.src)" style="cursor: zoom-in;">
+                        {% else %}
+                        <div class="no-evidence">
+                            {% if s in ['NOT_OBSERVED', 'NONE', 'HIGH'] and 'distraction' not in key %}
+                            <span class="no-evidence-icon">✅</span>
+                            No evidence needed
+                            {% else %}
+                            <span class="no-evidence-icon">📷</span>
+                            No image captured
+                            {% endif %}
+                        </div>
+                        {% endif %}
+                    </div>
+                </div>
+            </div>
+            {% endfor %}
+
+        </div>
+
+        <!-- Summary + Recommendations -->
+        <div class="summary-grid">
+            {% if overall_summary %}
+            <div class="summary-section">
+                <h2>🛡️ Overall Safety Assessment</h2>
+                <p>{{ overall_summary }}</p>
+            </div>
+            {% endif %}
+
+            {% if recommendations %}
+            <div class="summary-section">
+                <h2>📌 Recommendations</h2>
+                <p style="white-space: pre-line;">{{ recommendations }}</p>
+            </div>
+            {% endif %}
+        </div>
+
+        <!-- Action Buttons -->
+        <div class="action-bar">
+            <a href="/download-report" class="btn btn-primary">📥 Download PDF Report</a>
+            <button class="btn btn-secondary" onclick="toggleRaw()">📄 Show Raw AI Analysis</button>
+        </div>
+        <div class="raw-box" id="rawBox">{{ result }}</div>
+
+        <div style="text-align: center; margin-bottom: 24px;">
+            <a href="/" class="btn btn-ghost">← Analyze Another Video</a>
+        </div>
+
+        <div class="report-footer">
+            <span>Powered by Gemini AI</span>
+            <span class="footer-dot"></span>
+            <span>MediaPipe Face Mesh</span>
+            <span class="footer-dot"></span>
+            <span>YOLO v8</span>
+            <span class="footer-dot"></span>
+            <span>Custom Brake & Horn Detection</span>
+            <span class="footer-dot"></span>
+            <span>FastAPI</span>
+        </div>
+
+        {% endif %}
+
+    </div>
+
+    <script>
+        // File input & drag-drop
+        const dropZone = document.getElementById('dropZone');
+        const fileInput = document.getElementById('fileInput');
+        const fileNameDisplay = document.getElementById('fileName');
+
+        if (dropZone) {
+            // Click anywhere on drop-zone to open file picker
+            dropZone.addEventListener('click', (e) => {
+                if (e.target !== fileInput) {
+                    fileInput.click();
+                }
+            });
+            dropZone.addEventListener('dragover', (e) => {
+                e.preventDefault();
+                dropZone.classList.add('drag-over');
+            });
+            dropZone.addEventListener('dragleave', () => {
+                dropZone.classList.remove('drag-over');
+            });
+            dropZone.addEventListener('drop', (e) => {
+                e.preventDefault();
+                dropZone.classList.remove('drag-over');
+                if (e.dataTransfer.files.length) {
+                    fileInput.files = e.dataTransfer.files;
+                    showFileName(e.dataTransfer.files[0].name);
+                }
+            });
+        }
+
+        if (fileInput) {
+            fileInput.addEventListener('change', () => {
+                if (fileInput.files.length) {
+                    showFileName(fileInput.files[0].name);
+                }
+            });
+        }
+
+        function showFileName(name) {
+            if (fileNameDisplay) {
+                fileNameDisplay.textContent = '📎 ' + name;
+                fileNameDisplay.style.display = 'block';
+            }
+        }
+
+        // Loading overlay
+        const form = document.getElementById('uploadForm');
+        if (form) {
+            form.addEventListener('submit', () => {
+                document.getElementById('loadingOverlay').classList.add('active');
+            });
+        }
+
+        // Toggle raw analysis
+        function toggleRaw() {
+            const box = document.getElementById('rawBox');
+            box.classList.toggle('visible');
+        }
+
+        // Image zoom modal
+        function openModal(src) {
+            const modal = document.getElementById('imageModal');
+            const img = document.getElementById('modalImg');
+            img.src = src;
+            modal.classList.add('active');
+        }
+
+        function closeModal() {
+            document.getElementById('imageModal').classList.remove('active');
+        }
+
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') closeModal();
+        });
+    </script>
+
+</body>
+
+</html>

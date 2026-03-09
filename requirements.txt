@@ -1,0 +1,18 @@
+# Core web framework
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+python-multipart==0.0.9
+jinja2==3.1.4
+
+# Computer Vision
+opencv-python-headless==4.10.0.84
+numpy==1.26.4
+mediapipe==0.10.18
+Pillow==10.4.0
+
+# AI / ML
+ultralytics==8.2.92
+google-generativeai==0.8.3
+
+# PDF generation
+fpdf2==2.8.1
