@@ -1,0 +1,32 @@
+# Video files
+videos/
+
+# YOLO training dataset
+yolo_dataset/
+dataset/
+runs/
+
+# Runtime outputs
+frames/
+annotated/
+detections/
+faces/
+persons/
+face_crops/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
+
