@@ -129,9 +129,9 @@ templates = Jinja2Templates(directory="templates")
 app.mount("/detections", StaticFiles(directory=DETECTION_DIR), name="detections")
 
 # Configure Gemini
-api_key = os.environ.get("GEMINI_API_KEY", "AIzaSyDy-CS3pXL1FHAJuej1BoeEWmphTSnFQXA")
+api_key = os.environ.get("GEMINI_API_KEY")
 genai.configure(api_key=api_key)
-model = genai.GenerativeModel("gemini-2.0-flash")
+model = genai.GenerativeModel("gemini-2.5-flash")
 
 # Global store for the last analysis (used by PDF download)
 last_report = {
@@ -990,6 +990,20 @@ def compute_parameters_locally(frame_analyses):
         # Prefer a frame in the middle of the longest run
         return indices[len(indices) // 2]
 
+    def get_best_mobile_evidence(indices):
+        if not indices:
+            return None
+        best_idx = indices[len(indices) // 2]
+        min_y = float('inf')
+        for idx in indices:
+            for det in frame_analyses[idx].get("yolo_detections", []):
+                if det["class_name"] == "cell phone":
+                    y1 = det["bbox"][1]
+                    if y1 < min_y:
+                        min_y = y1
+                        best_idx = idx
+        return best_idx
+
     def best_brake_horn_evidence(indices, target_class):
         """Pick the frame with the highest confidence for the target brake/horn class."""
         if not indices:
@@ -1018,11 +1032,12 @@ def compute_parameters_locally(frame_analyses):
         alertness_status = "HIGH"
 
     alert_evidence = best_evidence(eyes_closed_indices or head_drooping_indices or yawning_indices)
-    alert_desc = f"PERCLOS={perclos:.1%} ({len(all_impaired)}/{total} frames with impaired eyes). "
-    alert_desc += f"Head drooping in {len(head_drooping_indices)} frames. "
-    if yawning_indices:
-        alert_desc += f"Yawning detected in {len(yawning_indices)} frames. "
-    alert_desc += f"Alertness composite score: {alertness_score:.2f}."
+    if alertness_status == "LOW":
+        alert_desc = "Low. Crew members exhibited signs of fatigue and lack of focus. Extended periods of drooping head or closed eyes observed."
+    elif alertness_status == "MODERATE":
+        alert_desc = "Moderate. Crew showed occasional signs of reduced alertness, such as brief drooping or yawning, but maintained general awareness."
+    else:
+        alert_desc = "High. Crew members remained alert, maintaining upright posture and active engagement."
 
     parameters["alertness"] = {
         "key": "alertness", "label": "Crew Alertness", "icon": "🧠",
@@ -1037,7 +1052,8 @@ def compute_parameters_locally(frame_analyses):
     # ====== 2. DISTRACTION ======
     # Based ONLY on head significantly turned from camera baseline
     # gaze_down is NOT distraction — crew looks down at controls/instruments
-    distracted_pct = len(head_turned_indices) / total
+    distracted_pct = len(head_turned_indices) / total if total > 0 else 0
+    dist_evidence = best_evidence(head_turned_indices)
 
     if distracted_pct > 0.3:
         distraction_status = "HIGH"
@@ -1048,9 +1064,14 @@ def compute_parameters_locally(frame_analyses):
     else:
         distraction_status = "NONE"
 
-    dist_evidence = best_evidence(head_turned_indices)
-    dist_desc = f"Head turned >30° from baseline in {len(head_turned_indices)}/{total} frames ({distracted_pct:.0%}). "
-    dist_desc += f"Camera baseline yaw: {baseline_yaw:.0f}°."
+    if distraction_status == "HIGH":
+        dist_desc = "High. A crew member was observed looking away from the track frequently, focusing on other directions for extended periods."
+    elif distraction_status == "MODERATE":
+        dist_desc = "Moderate. A crew member occasionally turned their head away from the forward view, indicating some level of divided attention."
+    elif distraction_status == "LOW":
+        dist_desc = "Low. Minor head turns observed, likely for checking necessary operational displays or surroundings."
+    else:
+        dist_desc = "None. Crew maintained forward focus without significant distraction."
 
     parameters["distraction"] = {
         "key": "distraction", "label": "Crew Distraction", "icon": "👀",
@@ -1069,19 +1090,22 @@ def compute_parameters_locally(frame_analyses):
     if len(writing_frames) >= 3:
         writing_status = "OBSERVED"
         writing_conf = "HIGH"
-        writing_desc = f"Book/document detected by YOLO in {len(book_indices)} frames, with gaze directed downward in {len(writing_frames)} of those. Strong evidence of writing/reading work."
+    if len(writing_frames) >= 3:
+        writing_status = "OBSERVED"
+        writing_conf = "HIGH"
+        writing_desc = "Observed. A crew member was seen actively focused downward on paperwork or a document while the locomotive was in motion."
     elif len(writing_only_book) >= 3:
         writing_status = "OBSERVED"
         writing_conf = "MEDIUM"
-        writing_desc = f"Book/document detected by YOLO in {len(book_indices)} frames. Gaze down overlap in {len(writing_frames)} frames."
+        writing_desc = "Observed. Books or documents were present and crew attention appeared directed towards them."
     elif len(writing_only_book) >= 1:
         writing_status = "OBSERVED"
         writing_conf = "LOW"
-        writing_desc = f"Book/document detected by YOLO in {len(book_indices)} frames but limited gaze-down evidence."
+        writing_desc = "Observed. Writing materials were visible, though active writing was brief or unclear."
     else:
         writing_status = "NOT_OBSERVED"
         writing_conf = "HIGH"
-        writing_desc = "No book or writing materials detected by YOLO in any frame."
+        writing_desc = "Not Observed. No writing materials were detected and no crew member was seen doing writing work."
 
     parameters["writing"] = {
         "key": "writing", "label": "Crew Doing Writing Work", "icon": "✍️",
@@ -1097,23 +1121,22 @@ def compute_parameters_locally(frame_analyses):
     if consecutive_closed >= 5:
         nap_status = "OBSERVED"
         nap_conf = "HIGH"
-        nap_desc = f"Eyes closed in {consecutive_closed} consecutive frames (strong napping evidence). "
+    if consecutive_closed >= 5:
+        nap_status = "OBSERVED"
+        nap_conf = "HIGH"
+        nap_desc = "Observed. A crew member appeared to be in a state of sleep, with prolonged periods of closed eyes."
     elif consecutive_closed >= 3:
         nap_status = "OBSERVED"
         nap_conf = "MEDIUM"
-        nap_desc = f"Eyes closed in {consecutive_closed} consecutive frames (possible micro-sleep). "
+        nap_desc = "Observed. A crew member exhibited signs of micro-sleep or deep rest with eyes closed multiple times."
     elif perclos > 0.4:
         nap_status = "OBSERVED"
         nap_conf = "MEDIUM"
-        nap_desc = f"High PERCLOS ({perclos:.0%}) indicates prolonged eye closure. "
+        nap_desc = "Observed. High frequency of prolonged eye closure indicates possible micro-sleep."
     else:
         nap_status = "NOT_OBSERVED"
         nap_conf = "HIGH"
-        nap_desc = f"Max consecutive eyes-closed: {consecutive_closed} frames. PERCLOS: {perclos:.1%}. "
-
-    nap_desc += f"Total eyes-closed frames: {len(eyes_closed_indices)}/{total}."
-    if head_drooping_indices:
-        nap_desc += f" Head drooping in {len(head_drooping_indices)} frames."
+        nap_desc = "Not Observed. No significant evidence of napping or prolonged eye closure was seen."
 
     parameters["nap"] = {
         "key": "nap", "label": "Crew Taking Nap / Micro-sleep", "icon": "😴",
@@ -1129,25 +1152,24 @@ def compute_parameters_locally(frame_analyses):
     if len(phone_indices) >= 3 and consecutive_phone >= 2:
         mobile_status = "OBSERVED"
         mobile_conf = "HIGH"
-        mobile_desc = f"Cell phone detected by YOLO in {len(phone_indices)}/{total} frames "
-        mobile_desc += f"({consecutive_phone} consecutive). Strong evidence of phone usage."
+        mobile_desc = "Observed. A crew member was seen actively using or holding a mobile phone during the monitored period."
     elif len(phone_indices) >= 2:
         mobile_status = "OBSERVED"
         mobile_conf = "MEDIUM"
-        mobile_desc = f"Cell phone detected by YOLO in {len(phone_indices)} frames. Possible phone usage."
+        mobile_desc = "Observed. Evidence suggests brief use or checking of a mobile phone by a crew member."
     elif len(phone_indices) == 1:
         mobile_status = "NOT_OBSERVED"
         mobile_conf = "MEDIUM"
-        mobile_desc = f"Cell phone detected in only 1 frame — likely false positive or brief glance."
+        mobile_desc = "Not Observed. Although a device was visible briefly, sustained usage was not confirmed."
     else:
         mobile_status = "NOT_OBSERVED"
         mobile_conf = "HIGH"
-        mobile_desc = "No cell phone detected by YOLO in any frame."
+        mobile_desc = "Not Observed. Neither crew member was seen using a mobile phone during the recorded period."
 
-    # Check for phone-like posture (gaze down + hand position) even without YOLO detection
+    # Check for phone-like posture (gaze down + hand position) even without direct detection
     gaze_down_no_book = sorted(set(gaze_down_indices) - set(book_indices))
     if len(gaze_down_no_book) > total * 0.2 and mobile_status == "NOT_OBSERVED":
-        mobile_desc += f" Note: gaze directed downward in {len(gaze_down_no_book)} frames without book — possible hidden phone use."
+        mobile_desc += " Note: Prolonged downward gaze observed without visible documents, suggesting possible hidden phone use."
 
     parameters["mobile"] = {
         "key": "mobile", "label": "Crew Using Mobile", "icon": "📱",
@@ -1156,27 +1178,20 @@ def compute_parameters_locally(frame_analyses):
         "confidence": mobile_conf,
         "timestamp": "N/A",
         "image_url": None,
-        "evidence_frame_idx": best_evidence(phone_indices),
+        "evidence_frame_idx": get_best_mobile_evidence(phone_indices),
     }
 
     # ====== 6. PACKING ======
-    # Bags in later half of video = more suspicious (preparing to leave)
-    late_bag_indices = [i for i in bag_indices if i > total * 0.6]
-    early_bag_indices = [i for i in bag_indices if i <= total * 0.4]
 
-    if len(late_bag_indices) >= 3 and len(late_bag_indices) > len(early_bag_indices):
-        packing_status = "OBSERVED"
-        packing_conf = "MEDIUM"
-        packing_desc = f"Bags detected by YOLO in {len(bag_indices)} frames, concentrated in the later portion ({len(late_bag_indices)} in last 40%). Suggests packing activity."
-    elif len(bag_indices) >= 5:
-        packing_status = "OBSERVED"
+
+    if len(bag_indices) > 0:
+        packing_status = "NOT_OBSERVED"
         packing_conf = "LOW"
-        packing_desc = f"Bags detected in {len(bag_indices)} frames. Could be stationary bags."
+        packing_desc = "Not Observed. Bags or belongings were detected in the cab, but they appear to be stationary."
     else:
         packing_status = "NOT_OBSERVED"
-        packing_conf = "HIGH" if not bag_indices else "MEDIUM"
-        packing_desc = f"Bags detected in {len(bag_indices)} frames. " if bag_indices else "No bags detected. "
-        packing_desc += "No significant packing activity observed."
+        packing_conf = "HIGH"
+        packing_desc = "Not Observed. No crew member was seen actively packing bags or gathering personal items."
 
     parameters["packing"] = {
         "key": "packing", "label": "Crew Packing Belongings", "icon": "🎒",
@@ -1185,7 +1200,7 @@ def compute_parameters_locally(frame_analyses):
         "confidence": packing_conf,
         "timestamp": "N/A",
         "image_url": None,
-        "evidence_frame_idx": best_evidence(late_bag_indices or bag_indices),
+        "evidence_frame_idx": best_evidence(bag_indices),
     }
 
     # ====== 7. LEAVING PLACE ======
@@ -1201,18 +1216,17 @@ def compute_parameters_locally(frame_analyses):
         if initial_count >= 2 and min_count <= initial_count - 1 and sustained_drop >= 3:
             leaving_status = "OBSERVED"
             leaving_conf = "HIGH" if sustained_drop >= 5 else "MEDIUM"
-            leaving_desc = f"Person count dropped from {initial_count} to {min_count} and stayed low for {sustained_drop} consecutive frames. "
-            leaving_desc += f"Person count timeline: initial={initial_count}, min={min_count}."
+            leaving_desc = "Observed. A crew member vacated their position and left the designated seat area."
             leaving_evidence = best_evidence(drop_indices)
         elif initial_count >= 2 and min_count < initial_count:
             leaving_status = "OBSERVED"
             leaving_conf = "LOW"
-            leaving_desc = f"Person count varied from {min_count} to {initial_count}. Possible brief absence."
+            leaving_desc = "Observed. Possible brief absence of a crew member from their designated monitoring position."
             leaving_evidence = best_evidence(drop_indices)
         else:
             leaving_status = "NOT_OBSERVED"
             leaving_conf = "HIGH"
-            leaving_desc = f"Person count stable at {initial_count}. No evidence of crew leaving."
+            leaving_desc = "Not Observed. Both crew members remained in their designated seats or expected operational areas."
     else:
         leaving_status = "NOT_OBSERVED"
         leaving_conf = "LOW"
@@ -1333,6 +1347,12 @@ def compute_parameters_locally(frame_analyses):
     # --- Save evidence images ---
     for key, param in parameters.items():
         idx = param.get("evidence_frame_idx")
+        status = param.get("status", "")
+        # Only save evidence if flagged
+        if status in ["NOT_OBSERVED", "NONE"] or (key == "alertness" and status == "HIGH"):
+            param["evidence_frame_idx"] = None
+            continue
+
         if idx is not None and 0 <= idx < total:
             source_path = frame_analyses[idx].get("annotated_path", frame_analyses[idx]["frame_path"])
             config = PARAMETER_CONFIG.get(next((k for k, v in PARAMETER_CONFIG.items() if v["key"] == key), ""), {})
@@ -1396,7 +1416,7 @@ def compute_parameters_locally(frame_analyses):
 # =========================
 # GEMINI DENSE ANALYSIS (every 7 seconds)
 # =========================
-GEMINI_FRAME_INTERVAL = 6  # Analyze one frame every 6 seconds
+GEMINI_FRAME_INTERVAL = 4  # Analyze one frame every 4 seconds
 
 GEMINI_PER_FRAME_PROMPT = """Analyze this locomotive cab CCTV frame for crew safety monitoring. 
 For EACH of the 9 parameters below, provide your assessment.
@@ -1417,7 +1437,7 @@ Rules:
 - DISTRACTION: Is anyone looking away from track/controls, turned around, not focused on duties?
 - WRITING: Say YES ONLY if you can clearly see a person actively writing on paper with a pen/pencil, or reading a physical document/book. Do NOT confuse instruments, control panels, gauges, or dashboards as writing materials. Operating controls is NOT writing.
 - NAPPING: Are eyes closed, head drooping, slumped posture? Signs of sleep?
-- MOBILE_PHONE: Is ANYONE holding, looking at, or using a mobile phone? Look for small screens, hand positions.
+- MOBILE_PHONE: Is ANYONE (including crew members standing in the background or partially obscured) actively holding, looking at, or using a mobile phone? You MUST scan ALL visible people in the entire cab. STRICTLY report NO if the phone is merely resting in a pocket, bag, or on a desk without being actively used.
 - PACKING: Is anyone handling bags, picking up personal items, organizing belongings, or preparing to leave? Look for bags being moved, items being gathered, crew standing up to collect things. Also say YES if seats appear recently vacated with belongings missing compared to normal.
 - LEAVING: Is any crew seat EMPTY that was previously occupied? Is someone standing, walking to the door, or at the exit? Is the cab partially or fully vacated? Fewer crew visible than expected (normally 2)? If you see an EMPTY CAB with no crew, this is definitely YES.
 - HORN: Is any crew member reaching for, pressing, or operating the horn lever/switch? Look for hand on or near the horn lever (usually located on the upper portion of the control panel/console).
@@ -1477,27 +1497,22 @@ def analyze_with_gemini_dense(parameters, frame_analyses):
     if total == 0:
         return parameters, "No frames to analyze."
 
-    # Select frames every ~6 seconds, PLUS all frames in the last 8 seconds
-    # Find which frame indices correspond to interval-based + dense end-of-video
+    # Select frames strictly every GEMINI_FRAME_INTERVAL seconds, PLUS dense at the end
     gemini_indices = []
     next_target_time = 0
     last_timestamp = frame_analyses[-1]["timestamp"] if frame_analyses else 0
-    dense_start_time = max(0, last_timestamp - 8)  # Last 8 seconds
+    dense_start_time = max(0, last_timestamp - 8)
 
     for i, fa in enumerate(frame_analyses):
         ts = fa["timestamp"]
         if ts >= dense_start_time:
-            # In the last 8 seconds — include every frame
             gemini_indices.append(i)
         elif ts >= next_target_time:
-            # Normal interval-based selection
             gemini_indices.append(i)
             next_target_time = ts + GEMINI_FRAME_INTERVAL
 
-    # Deduplicate and sort
     gemini_indices = sorted(set(gemini_indices))
-
-    print(f"  Sending {len(gemini_indices)} frames to Gemini (every {GEMINI_FRAME_INTERVAL}s + dense last 8s)...")
+    print(f"  Sending {len(gemini_indices)} frames to Gemini (every {GEMINI_FRAME_INTERVAL}s + dense end)...")
 
     # Per-frame Gemini results
     gemini_votes = {
@@ -1512,7 +1527,7 @@ def analyze_with_gemini_dense(parameters, frame_analyses):
         "brake_a9": [],
     }
     gemini_reasons = {k: [] for k in gemini_votes}
-    gemini_evidence = {k: None for k in gemini_votes}  # Best evidence frame idx
+    gemini_evidence = {k: [] for k in gemini_votes}  # List of all YES indices
 
     result_text_parts = []
 
@@ -1540,12 +1555,10 @@ def analyze_with_gemini_dense(parameters, frame_analyses):
 
                     # Track evidence frames for flagged items
                     if param_key == "alertness" and value in ["LOW", "MODERATE"]:
-                        if gemini_evidence[param_key] is None:
-                            gemini_evidence[param_key] = idx
+                        gemini_evidence[param_key].append(idx)
                         flags.append(f"alert={value}")
                     elif param_key != "alertness" and value == "YES":
-                        if gemini_evidence[param_key] is None:
-                            gemini_evidence[param_key] = idx
+                        gemini_evidence[param_key].append(idx)
                         flags.append(param_key)
 
             flag_str = ", ".join(flags) if flags else "OK"
@@ -1573,20 +1586,16 @@ def analyze_with_gemini_dense(parameters, frame_analyses):
             gemini_alertness = "HIGH"
         
         parameters["alertness"]["status"] = gemini_alertness
-        parameters["alertness"]["description"] = (
-            f"Gemini analysis of {gemini_total} frames: "
-            f"HIGH={high_count}, MODERATE={mod_count}, LOW={low_count}. "
-            f"{parameters['alertness']['description']}"
-        )
+        # Description is already set by local CV, we'll keep it or let Gemini overwrite it later
         if gemini_evidence["alertness"]:
-            parameters["alertness"]["evidence_frame_idx"] = gemini_evidence["alertness"]
+            parameters["alertness"]["evidence_frame_idx"] = gemini_evidence["alertness"][0]
 
     # For binary parameters (YES/NO), use Gemini vote counts
     binary_params = {
         "distraction": {"label": "Crew Distraction", "threshold": 0.2},
         "writing": {"label": "Crew Doing Writing Work", "threshold": 0.01},
         "nap": {"label": "Crew Taking Nap / Micro-sleep", "threshold": 0.02},
-        "mobile": {"label": "Crew Using Mobile", "threshold": 0.1},
+        "mobile": {"label": "Crew Using Mobile", "threshold": 0.05},
         "packing": {"label": "Crew Packing Belongings", "threshold": 0.02},
         "leaving": {"label": "Crew Leaving Place", "threshold": 0.02},
         "horn": {"label": "Crew Operating Horn Lever/Switch", "threshold": 0.1},
@@ -1607,11 +1616,9 @@ def analyze_with_gemini_dense(parameters, frame_analyses):
                 # Custom YOLO already detected this — append Gemini info but don't override
                 yes_count = sum(1 for v in votes if v == "YES")
                 yes_pct = yes_count / len(votes) if votes else 0
-                yes_reasons = [r for v, r in zip(votes, gemini_reasons[param_key]) if v == "YES" and r]
-                gemini_note = f" Gemini corroboration: {yes_count}/{len(votes)} frames ({yes_pct:.0%})."
-                if yes_reasons:
-                    gemini_note += f" {' | '.join(yes_reasons[:2])}"
-                parameters[param_key]["description"] += gemini_note
+                # Custom YOLO already detected this
+                if yes_count > 0:
+                    pass # We do not alter description, keep local human-readable text
                 continue
 
         # For packing and leaving: if local CV already flagged as OBSERVED (e.g. zero-person rule),
@@ -1621,17 +1628,20 @@ def analyze_with_gemini_dense(parameters, frame_analyses):
             if current_status == "OBSERVED":
                 yes_count = sum(1 for v in votes if v == "YES")
                 yes_pct = yes_count / len(votes) if votes else 0
-                yes_reasons = [r for v, r in zip(votes, gemini_reasons[param_key]) if v == "YES" and r]
-                gemini_note = f" Gemini: {yes_count}/{len(votes)} frames ({yes_pct:.0%})."
-                if yes_reasons:
-                    gemini_note += f" {' | '.join(yes_reasons[:2])}"
-                parameters[param_key]["description"] += gemini_note
+                # Already observed locally, do not append model internal details
                 continue
 
         yes_count = sum(1 for v in votes if v == "YES")
         yes_pct = yes_count / len(votes) if votes else 0
         
-        if yes_pct >= config["threshold"]:
+        if param_key == "mobile":
+            if yes_count >= 2:
+                gemini_status = "OBSERVED"
+                conf = "HIGH"
+            else:
+                gemini_status = "NOT_OBSERVED"
+                conf = "MEDIUM" if yes_count == 1 else "HIGH"
+        elif yes_pct >= config["threshold"]:
             gemini_status = "OBSERVED"
             if yes_count >= 3:
                 conf = "HIGH"
@@ -1650,15 +1660,86 @@ def analyze_with_gemini_dense(parameters, frame_analyses):
         # For horn/brake_a9 when YOLO didn't detect: let Gemini set the status
         parameters[param_key]["status"] = gemini_status
         parameters[param_key]["confidence"] = conf
-        parameters[param_key]["description"] = (
-            f"Gemini: {yes_count}/{len(votes)} frames flagged ({yes_pct:.0%}). {reason_str}"
-        )
-        if gemini_evidence[param_key]:
-            parameters[param_key]["evidence_frame_idx"] = gemini_evidence[param_key]
+        
+        if gemini_status == "OBSERVED":
+            yes_indices = gemini_evidence[param_key]
+            if param_key == "mobile" and yes_indices:
+                # Find the frame where the phone is highest up among the Gemini YES frames
+                best_idx = yes_indices[len(yes_indices)//2]
+                min_y = float('inf')
+                for idx in yes_indices:
+                    for det in frame_analyses[idx].get("yolo_detections", []):
+                        if det["class_name"] == "cell phone":
+                            y1 = det["bbox"][1]
+                            if y1 < min_y:
+                                min_y = y1
+                                best_idx = idx
+                parameters[param_key]["evidence_frame_idx"] = best_idx
+            elif yes_indices:
+                parameters[param_key]["evidence_frame_idx"] = yes_indices[0]
+        
+        # Use a human-readable description instead of the raw analysis metrics
+        if param_key == "alertness":
+            if parameters[param_key]["status"] == "LOW":
+                desc = "Low. Crew members exhibited signs of fatigue and lack of focus. Extended periods of drooping head or closed eyes observed."
+            elif parameters[param_key]["status"] == "MODERATE":
+                desc = "Moderate. Crew showed occasional signs of reduced alertness, such as brief drooping or yawning, but maintained general awareness."
+            else:
+                desc = "High. Crew members remained alert, maintaining upright posture and active engagement."
+        elif param_key == "distraction":
+            if parameters[param_key]["status"] in ["HIGH", "OBSERVED"]:
+                desc = "High. A crew member was observed looking away from the track frequently, focusing on other directions for extended periods."
+            else:
+                desc = "Not Observed. Crew maintained forward focus without significant distraction."
+        elif param_key == "writing":
+            if parameters[param_key]["status"] == "OBSERVED":
+                desc = "Observed. A crew member was seen actively focused downward on paperwork or a document while the locomotive was in motion."
+            else:
+                desc = "Not Observed. No crew member was seen doing writing work."
+        elif param_key == "nap":
+            if parameters[param_key]["status"] == "OBSERVED":
+                desc = "Observed. A crew member appeared to be in a state of sleep, with prolonged periods of closed eyes."
+            else:
+                desc = "Not Observed. No significant evidence of napping or prolonged eye closure was seen."
+        elif param_key == "mobile":
+            if parameters[param_key]["status"] == "OBSERVED":
+                desc = "Observed. A crew member was seen actively using or holding a mobile phone during the monitored period."
+            else:
+                desc = "Not Observed. Neither crew member was seen using a mobile phone during the recorded period."
+        elif param_key == "packing":
+            if parameters[param_key]["status"] == "OBSERVED":
+                desc = "Observed. Activity indicating handling of personal belongings or packing bags was noted."
+            else:
+                desc = "Not Observed. No crew member was seen actively packing bags or gathering personal items."
+        elif param_key == "leaving":
+            if parameters[param_key]["status"] == "OBSERVED":
+                desc = "Observed. A crew member vacated their position and left the designated seat area."
+            else:
+                desc = "Not Observed. Both crew members remained in their designated seats or expected operational areas."
+        elif param_key == "horn":
+            if parameters[param_key]["status"] == "OBSERVED":
+                desc = "Observed. A crew member was seen operating the horn lever/switch."
+            else:
+                desc = "Not Observed. No horn lever activation was detected."
+        elif param_key == "brake_a9":
+            if parameters[param_key]["status"] == "OBSERVED":
+                desc = "Observed. The Loco Pilot was seen applying the A9/SA9 brake handle."
+            else:
+                desc = "Not Observed. No A9/SA9 brake application was detected."
+        else:
+            desc = parameters[param_key]["description"]
+            
+        parameters[param_key]["description"] = desc
 
     # --- Save evidence images ---
     for key, param in parameters.items():
         idx = param.get("evidence_frame_idx")
+        status = param.get("status", "")
+        # Only save evidence if flagged
+        if status in ["NOT_OBSERVED", "NONE"] or (key == "alertness" and status == "HIGH"):
+            param["evidence_frame_idx"] = None
+            continue
+
         if idx is not None and 0 <= idx < total:
             source_path = frame_analyses[idx].get("annotated_path", frame_analyses[idx]["frame_path"])
             param["image_url"] = save_detection_image(
@@ -1687,9 +1768,9 @@ def analyze_with_gemini_dense(parameters, frame_analyses):
         issues.append("A9/SA9 brake application detected")
 
     if not issues:
-        overall_summary = f"Gemini analyzed {gemini_total} frames. Generally safe crew behavior. No critical violations."
+        overall_summary = "Analysis complete. Generally safe crew behavior. No critical violations."
     else:
-        overall_summary = f"Gemini analyzed {gemini_total} frames, flagged {len(issues)} concern(s): {', '.join(issues)}."
+        overall_summary = f"Analysis flagged {len(issues)} concern(s): {', '.join(issues)}."
 
     recs = []
     if parameters.get("alertness", {}).get("status") != "HIGH":
@@ -1710,7 +1791,7 @@ def analyze_with_gemini_dense(parameters, frame_analyses):
         recs.append("- Continue monitoring. Crew behavior appears compliant.")
     recommendations = "\n".join(recs)
 
-    result_text = f"Gemini analyzed {gemini_total} frames (every {GEMINI_FRAME_INTERVAL}s). {overall_summary}"
+    result_text = f"Analysis complete. {overall_summary}"
     return parameters, overall_summary, recommendations, result_text
 
 
