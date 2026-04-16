@@ -13,6 +13,8 @@ from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
 import google.generativeai as genai
+from dotenv import load_dotenv
+load_dotenv()
 from PIL import Image
 from fpdf import FPDF
 
@@ -130,6 +132,8 @@ app.mount("/detections", StaticFiles(directory=DETECTION_DIR), name="detections"
 
 # Configure Gemini
 api_key = os.environ.get("GEMINI_API_KEY")
+if not api_key:
+    raise EnvironmentError("GEMINI_API_KEY is not set. Add it to your .env file.")
 genai.configure(api_key=api_key)
 model = genai.GenerativeModel("gemini-2.5-flash")
 
