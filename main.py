@@ -2095,7 +2095,7 @@ def build_final_summary(parameters):
     if parameters.get('alertness', {}).get('status') == 'LOW':
         issues.append('low alertness')
     if parameters.get('alertness', {}).get('status') == 'MODERATE':
-        issues.append('moderate alertness/yawning')
+        issues.append('moderate alertness')
     if parameters.get('nap', {}).get('status') == 'OBSERVED':
         issues.append('napping/micro-sleep')
     if parameters.get('mobile', {}).get('status') == 'OBSERVED':
