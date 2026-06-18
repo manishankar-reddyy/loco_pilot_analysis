@@ -106,8 +106,8 @@ FACE_ROI_MIN_SIZE = 400
 VLM_MODEL_ID       = os.getenv('VLM_MODEL_ID', 'Qwen/Qwen2.5-VL-7B-Instruct')
 VLM_MAX_EVENTS     = int(os.getenv('VLM_MAX_EVENTS', '8'))
 VLM_MAX_TOKENS     = int(os.getenv('VLM_MAX_TOKENS', '140'))
-VLM_IMAGE_SIZE     = int(os.getenv('VLM_IMAGE_SIZE', '384'))
-VLM_CONTEXT_IMAGES = int(os.getenv('VLM_CONTEXT_IMAGES', '4'))
+VLM_IMAGE_SIZE     = int(os.getenv('VLM_IMAGE_SIZE', '448'))
+VLM_CONTEXT_IMAGES = int(os.getenv('VLM_CONTEXT_IMAGES', '6'))
 ENABLE_VLM         = ENABLE_VLM
 DENSE_EVENT_WINDOW_SECONDS = 6
 DENSE_EVENT_FPS = 1
@@ -254,25 +254,24 @@ def load_vlm_model():
 
     bnb = BitsAndBytesConfig(
         load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
+        bnb_4bit_quant_type='nf4',
         bnb_4bit_compute_dtype=torch.float16,
         bnb_4bit_use_double_quant=True,
     )
-    print(f"Loading {VLM_MODEL_ID} (4-bit NF4) for local RTX 3050 6GB profile...")
-    print(f"CUDA device: {torch.cuda.get_device_name(0)}")
+    print(f'Loading {VLM_MODEL_ID} (4-bit NF4)...')
+    print('  First run will download ~15 GB. Subsequent runs use cache.\n')
     vlm_model = _VLMClass.from_pretrained(
         VLM_MODEL_ID,
         quantization_config=bnb,
-        device_map={"": 0},
+        device_map='auto',
         torch_dtype=torch.float16,
-        low_cpu_mem_usage=True,
     )
     vlm_model.eval()
     vlm_processor = AutoProcessor.from_pretrained(VLM_MODEL_ID)
     process_vision_info = _process_vision_info
     used = torch.cuda.memory_allocated() / 1e9
     total = torch.cuda.get_device_properties(0).total_memory / 1e9
-    print(f"VLM loaded. VRAM used: {used:.1f} GB / {total:.1f} GB")
+    print(f'VLM loaded. VRAM used: {used:.1f} GB / {total:.1f} GB')
     return vlm_model, vlm_processor, process_vision_info
 
 
@@ -325,6 +324,10 @@ def get_thread_landmarker():
 # Warm up main-thread instance
 _main_lm = FaceLandmarker.create_from_options(_make_landmarker_options())
 print(f'  MediaPipe FaceLandmarker ready ({MEDIAPIPE_THREADS} worker threads)')
+
+# Load VLM at startup (matches notebook Cell 7 — eager load)
+if ENABLE_VLM:
+    load_vlm_model()
 
 
 
@@ -737,9 +740,10 @@ def ensure_annotated_frame(frame_analyses, idx):
 def save_evidence_image(frame_path, prefix):
     if not frame_path or not os.path.exists(frame_path):
         return None
-    out = f"{DETECTION_DIR}/{prefix}_{int(_time.time()*1000)}.jpg"
+    filename = f"{prefix}_{int(_time.time()*1000)}.jpg"
+    out = f"{DETECTION_DIR}/{filename}"
     import shutil; shutil.copy2(frame_path, out)
-    return out
+    return f"/detections/{filename}"
 
 
 def _bbox_iou(a, b):
@@ -1950,9 +1954,10 @@ def fuse_event_score(candidate, vlm_result=None):
 def _save_candidate_evidence(candidate, frame_analyses, key):
     src_item = candidate.metadata.get('evidence_frame_item')
     if src_item and src_item.get('image') is not None:
-        p = f"{DETECTION_DIR}/{key}_{int(time.time() * 1000)}.jpg"
+        filename = f"{key}_{int(time.time() * 1000)}.jpg"
+        p = f"{DETECTION_DIR}/{filename}"
         cv2.imwrite(p, src_item['image'])
-        return p
+        return f"/detections/{filename}"
     idx = candidate.evidence_frame
     if idx is not None and 0 <= idx < len(frame_analyses):
         ann = ensure_annotated_frame(frame_analyses, idx)
@@ -2276,15 +2281,17 @@ def generate_pdf_report(parameters, overall_summary, recommendations, video_info
         pdf.set_text_color(130, 130, 130)
         pdf.multi_cell(0, 5, '  |  '.join(details), new_x='LMARGIN', new_y='NEXT')
 
-        img_path = p.get('image_url')
-        if img_path and os.path.exists(img_path):
-            try:
-                if pdf.get_y() > 210:
-                    pdf.add_page()
-                pdf.image(img_path, x=15, w=80, h=55)
-                pdf.ln(2)
-            except Exception:
-                pass
+        img_url = p.get('image_url')
+        if img_url:
+            img_path = str(BASE_DIR / img_url.lstrip("/"))
+            if os.path.exists(img_path):
+                try:
+                    if pdf.get_y() > 210:
+                        pdf.add_page()
+                    pdf.image(img_path, x=15, w=80, h=55)
+                    pdf.ln(2)
+                except Exception:
+                    pass
         pdf.ln(4)
         pdf.set_draw_color(200, 200, 200)
         pdf.line(10, pdf.get_y(), 200, pdf.get_y())
@@ -2362,12 +2369,18 @@ def run_local_pipeline(video_path: str, video_filename: str):
     PROFILER.start("local_cv_total")
     frame_analyses = run_full_local_analysis(frames)
     PROFILER.stop({"frames": len(frame_analyses)})
+    print(f"  Faces detected: {sum(f['face_analysis']['faces_detected'] for f in frame_analyses)}")
+    print(f"  Phone frames : {sum(1 for f in frame_analyses if f['phone_detected'])}")
+    print(f"  Horn frames  : {sum(1 for f in frame_analyses if f['horn_active_detected'])}")
 
     print("=" * 60)
     print("STEP 3: Rule-based parameter computation")
     PROFILER.start("rule_engine")
     parameters, local_summary, local_recs = compute_parameters_locally(frame_analyses)
     PROFILER.stop()
+    for k, p in parameters.items():
+        icon = 'ALERT' if p['status'] in ('LOW', 'OBSERVED') else '  ok'
+        print(f"  [{icon}] {p['label']}: {p['status']} (conf={p['confidence']})")
 
     print("=" * 60)
     print("STEP 4: Event candidate generation")
@@ -2408,6 +2421,32 @@ def run_local_pipeline(video_path: str, video_filename: str):
     PROFILER.stop()
     total_time = time.time() - pipeline_start
     PROFILER.add("TOTAL", total_time)
+
+    profile_payload = PROFILER.report()
+    profile_payload.update({
+        'video_info': video_info,
+        'final_parameters': parameters,
+        'event_candidates': [c.to_dict() for c in event_candidates],
+        'vlm_raw_outputs': vlm_raw_outputs,
+    })
+    profile_path = f'{PROFILE_DIR}/analysis_profile.json'
+    with open(profile_path, 'w') as f:
+        json.dump(profile_payload, f, indent=2)
+
+    print("=" * 60)
+    print("TIMING SUMMARY")
+    print("=" * 60)
+    for row in profile_payload['timings']:
+        print(f"  {row['stage']:<24}: {row['seconds']:7.2f}s ({row['calls']} calls)")
+    print()
+    print("FINAL RESULTS:")
+    for k, p in parameters.items():
+        icon = 'ALERT' if p['status'] in ('LOW', 'OBSERVED') else '  ok'
+        print(f"  [{icon}] {p['label']}: {p['status']} ({p['confidence']})")
+    print()
+    print(f"SUMMARY: {final_summary}")
+    print(f"PDF: {pdf_path}")
+    print(f"Profile JSON: {profile_path}")
     print(f"Pipeline complete in {total_time:.1f}s")
 
     result_text = f"Analysis complete in {total_time:.1f}s. {final_summary}"
