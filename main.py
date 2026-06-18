@@ -17,43 +17,59 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 BASE_DIR = Path(__file__).resolve().parent
 os.chdir(BASE_DIR)
 
-AUTO_INSTALL_DEPS = os.getenv("AUTO_INSTALL_DEPS", "0").strip().lower() in {"1", "true", "yes", "on"}
 ENABLE_VLM = os.getenv("ENABLE_VLM", "1").strip().lower() in {"1", "true", "yes", "on"}
+
+def _pip(*args):
+    import subprocess
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", *args])
 
 def _ensure_package(module_name: str, package_spec: str) -> None:
     try:
         __import__(module_name)
-    except Exception:
-        if not AUTO_INSTALL_DEPS:
-            raise RuntimeError(
-                f"Missing dependency '{module_name}'. Install '{package_spec}' or set AUTO_INSTALL_DEPS=1."
-            )
-        import subprocess
-        subprocess.check_call([sys.executable, "-m", "pip", "install", package_spec])
+    except ImportError:
+        print(f"  Installing {package_spec}...")
+        _pip(package_spec)
 
+def _ensure_torch_cuda() -> None:
+    """Install PyTorch with CUDA 12.1 if not already present with CUDA support."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return
+        print("  PyTorch found but CUDA unavailable — reinstalling CUDA 12.1 build...")
+    except ImportError:
+        print("  Installing PyTorch (CUDA 12.1)...")
+    _pip(
+        "torch==2.3.1", "torchvision==0.18.1",
+        "--index-url", "https://download.pytorch.org/whl/cu121",
+    )
+
+print("Checking dependencies...")
 for _module, _package in [
-    ("cv2", "opencv-python"),
-    ("numpy", "numpy"),
-    ("PIL", "pillow"),
-    ("fpdf", "fpdf2==2.8.1"),
-    ("ultralytics", "ultralytics==8.2.92"),
-    ("mediapipe", "mediapipe==0.10.18"),
-    ("fastapi", "fastapi"),
-    ("jinja2", "jinja2"),
-    ("uvicorn", "uvicorn[standard]"),
-    ("multipart", "python-multipart"),
+    ("cv2",        "opencv-python-headless"),
+    ("numpy",      "numpy==1.26.4"),
+    ("PIL",        "pillow"),
+    ("fpdf",       "fpdf2==2.8.1"),
+    ("ultralytics","ultralytics==8.2.92"),
+    ("mediapipe",  "mediapipe==0.10.18"),
+    ("fastapi",    "fastapi"),
+    ("jinja2",     "jinja2"),
+    ("uvicorn",    "uvicorn[standard]"),
+    ("multipart",  "python-multipart"),
 ]:
     _ensure_package(_module, _package)
 
 if ENABLE_VLM:
+    _ensure_torch_cuda()
     for _module, _package in [
-        ("torch", "torch"),
-        ("transformers", "transformers>=4.52.0"),
-        ("accelerate", "accelerate>=0.34.0"),
-        ("bitsandbytes", "bitsandbytes>=0.44.0"),
+        ("transformers",  "transformers>=4.52.0"),
+        ("accelerate",    "accelerate>=0.34.0"),
+        ("bitsandbytes",  "bitsandbytes>=0.44.0"),
         ("qwen_vl_utils", "qwen-vl-utils>=0.0.8"),
     ]:
         _ensure_package(_module, _package)
+
+print("Dependencies ready.")
 
 import cv2
 import numpy as np
