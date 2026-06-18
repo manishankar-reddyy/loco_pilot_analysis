@@ -1,2552 +1,2499 @@
+from __future__ import annotations
+
 import os
-import cv2
-import shutil
-import time
-import re
+import sys
 import json
 import math
-import numpy as np
+import time
+import shutil
+import traceback
 import urllib.request
+from pathlib import Path
 from datetime import datetime
+from dataclasses import dataclass, asdict, field
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+BASE_DIR = Path(__file__).resolve().parent
+os.chdir(BASE_DIR)
+
+AUTO_INSTALL_DEPS = os.getenv("AUTO_INSTALL_DEPS", "0").strip().lower() in {"1", "true", "yes", "on"}
+ENABLE_VLM = os.getenv("ENABLE_VLM", "1").strip().lower() in {"1", "true", "yes", "on"}
+
+def _ensure_package(module_name: str, package_spec: str) -> None:
+    try:
+        __import__(module_name)
+    except Exception:
+        if not AUTO_INSTALL_DEPS:
+            raise RuntimeError(
+                f"Missing dependency '{module_name}'. Install '{package_spec}' or set AUTO_INSTALL_DEPS=1."
+            )
+        import subprocess
+        subprocess.check_call([sys.executable, "-m", "pip", "install", package_spec])
+
+for _module, _package in [
+    ("cv2", "opencv-python"),
+    ("numpy", "numpy"),
+    ("PIL", "pillow"),
+    ("fpdf", "fpdf2==2.8.1"),
+    ("ultralytics", "ultralytics==8.2.92"),
+    ("mediapipe", "mediapipe==0.10.18"),
+    ("fastapi", "fastapi"),
+    ("jinja2", "jinja2"),
+    ("uvicorn", "uvicorn[standard]"),
+    ("multipart", "python-multipart"),
+]:
+    _ensure_package(_module, _package)
+
+if ENABLE_VLM:
+    for _module, _package in [
+        ("torch", "torch"),
+        ("transformers", "transformers>=4.52.0"),
+        ("accelerate", "accelerate>=0.34.0"),
+        ("bitsandbytes", "bitsandbytes>=0.44.0"),
+        ("qwen_vl_utils", "qwen-vl-utils>=0.0.8"),
+    ]:
+        _ensure_package(_module, _package)
+
+import cv2
+import numpy as np
+import torch
+from PIL import Image
 from fastapi import FastAPI, UploadFile, File, Request
 from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
-import google.generativeai as genai
-from dotenv import load_dotenv
-load_dotenv()
+
+FACE_LANDMARKER_PATH = str(BASE_DIR / "face_landmarker.task")
+FACE_LANDMARKER_URL = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task"
+BRAKE_HORN_MODEL_PATH = str(BASE_DIR / "brake_horn_detection.pt") if (BASE_DIR / "brake_horn_detection.pt").exists() else None
+
+if not os.path.exists(FACE_LANDMARKER_PATH):
+    print("Downloading face_landmarker.task (~3.7 MB)...")
+    urllib.request.urlretrieve(FACE_LANDMARKER_URL, FACE_LANDMARKER_PATH)
+    print(f"face_landmarker.task ready ({os.path.getsize(FACE_LANDMARKER_PATH)/1e6:.1f} MB)")
+
+# CELL 5: Configuration + profiling utilities
+import os, json, time, math, statistics, traceback
+from dataclasses import dataclass, asdict, field
+from collections import defaultdict
+
+FRAME_DIR     = str(BASE_DIR / 'frames')
+ANNOTATED_DIR = str(BASE_DIR / 'annotated')
+DETECTION_DIR = str(BASE_DIR / 'detections')
+CROP_DIR      = str(BASE_DIR / 'face_crops')
+PROFILE_DIR   = str(BASE_DIR / 'profiles')
+for d in [FRAME_DIR, ANNOTATED_DIR, DETECTION_DIR, CROP_DIR, PROFILE_DIR]:
+    os.makedirs(d, exist_ok=True)
+
+MAX_FRAMES        = 200
+SAMPLE_INTERVAL   = 4
+END_DENSE_SECONDS = 8
+KEEP_FRAMES_IN_MEMORY = True
+WRITE_EXTRACTED_FRAMES = False
+
+YOLO_BATCH_SIZE = int(os.getenv('YOLO_BATCH_SIZE', '32'))
+YOLO_BATCH_CANDIDATES = [16, 32, 64]
+
+MEDIAPIPE_THREADS = int(os.getenv('MEDIAPIPE_THREADS', '4'))
+MEDIAPIPE_MIN_PERSON_CONF = 0.4
+FACE_ROI_MIN_SIZE = 400
+
+VLM_MODEL_ID       = os.getenv('VLM_MODEL_ID', 'Qwen/Qwen2.5-VL-7B-Instruct')
+VLM_MAX_EVENTS     = int(os.getenv('VLM_MAX_EVENTS', '8'))
+VLM_MAX_TOKENS     = int(os.getenv('VLM_MAX_TOKENS', '140'))
+VLM_IMAGE_SIZE     = int(os.getenv('VLM_IMAGE_SIZE', '448'))
+VLM_CONTEXT_IMAGES = int(os.getenv('VLM_CONTEXT_IMAGES', '6'))
+ENABLE_VLM         = ENABLE_VLM
+DENSE_EVENT_WINDOW_SECONDS = 6
+DENSE_EVENT_FPS = 1
+DENSE_EVENT_BEHAVIORS = {'writing', 'nap', 'alertness', 'distraction', 'attention_state'}
+
+FUSION_THRESHOLDS = {
+    'mobile': 0.62, 'writing': 0.48, 'packing': 0.62, 'leaving': 0.65,
+    'nap': 0.62, 'distraction': 0.58, 'horn': 0.55, 'brake_a9': 0.55,
+}
+GROUND_TRUTH_JSON = None
+
+YOLO_CLASSES = {
+    0: 'person', 67: 'cell_phone', 24: 'backpack',
+    26: 'handbag', 28: 'suitcase', 73: 'book', 63: 'laptop',
+}
+BRAKE_HORN_CLASSES = {
+    0: 'horn_active', 1: 'horn_inactive', 2: 'brake_applied', 3: 'brake_released',
+}
+YOLO_COLORS = {
+    'person': (0,255,0), 'cell_phone': (0,0,255), 'backpack': (255,0,255),
+    'handbag': (255,0,255), 'suitcase': (255,0,255), 'book': (0,165,255),
+    'laptop': (0,165,255), 'horn_active': (255,0,0), 'brake_applied': (0,0,255),
+    'horn_inactive': (180,180,180), 'brake_released': (180,180,180),
+}
+
+class PipelineProfiler:
+    def __init__(self):
+        self.timings = defaultdict(float)
+        self.counts = defaultdict(int)
+        self.events = []
+        self.stage_stack = []
+
+    def cuda_sync(self):
+        try:
+            if 'torch' in globals() and torch.cuda.is_available():
+                torch.cuda.synchronize()
+        except Exception:
+            pass
+
+    def start(self, name, sync_cuda=False):
+        if sync_cuda:
+            self.cuda_sync()
+        self.stage_stack.append((name, time.time(), sync_cuda))
+
+    def stop(self, extra=None):
+        name, t0, sync_cuda = self.stage_stack.pop()
+        if sync_cuda:
+            self.cuda_sync()
+        dt = time.time() - t0
+        self.timings[name] += dt
+        self.counts[name] += 1
+        item = {'stage': name, 'seconds': round(dt, 4)}
+        if extra:
+            item.update(extra)
+        self.events.append(item)
+        return dt
+
+    def add(self, name, seconds, extra=None):
+        self.timings[name] += float(seconds)
+        self.counts[name] += 1
+        item = {'stage': name, 'seconds': round(float(seconds), 4)}
+        if extra:
+            item.update(extra)
+        self.events.append(item)
+
+    def snapshot_gpu(self):
+        try:
+            if 'torch' in globals() and torch.cuda.is_available():
+                return {
+                    'gpu_name': torch.cuda.get_device_name(0),
+                    'vram_allocated_gb': round(torch.cuda.memory_allocated()/1e9, 3),
+                    'vram_reserved_gb': round(torch.cuda.memory_reserved()/1e9, 3),
+                    'vram_total_gb': round(torch.cuda.get_device_properties(0).total_memory/1e9, 3),
+                }
+        except Exception:
+            pass
+        return {}
+
+    def report(self):
+        rows = []
+        for k, v in sorted(self.timings.items(), key=lambda kv: -kv[1]):
+            rows.append({'stage': k, 'seconds': round(v, 3), 'calls': self.counts[k]})
+        return {'timings': rows, 'events': self.events, 'gpu': self.snapshot_gpu()}
+
+PROFILER = PipelineProfiler()
+
+@dataclass
+class EventCandidate:
+    behavior: str
+    start_ts: int
+    end_ts: int
+    frame_indices: list
+    track_ids: list = field(default_factory=list)
+    local_score: float = 0.0
+    vlm_score: float = 0.0
+    final_score: float = 0.0
+    decision: str = 'UNRESOLVED'
+    evidence_frame: int = None
+    reason: str = ''
+    needs_vlm: bool = False
+    metadata: dict = field(default_factory=dict)
+
+    def to_dict(self):
+        data = asdict(self)
+        meta = dict(data.get('metadata') or {})
+        if 'dense_frames' in meta:
+            meta['dense_frames'] = [f.get('timestamp') for f in meta['dense_frames']]
+        if 'evidence_frame_item' in meta:
+            item = meta['evidence_frame_item']
+            meta['evidence_frame_item'] = {
+                'timestamp': item.get('timestamp'),
+                'is_dense_event_frame': bool(item.get('is_dense_event_frame')),
+            }
+        data['metadata'] = meta
+        return data
+
+print('Configuration ready.')
+print(f'  VLM        : {VLM_MODEL_ID}')
+print(f'  YOLO batch : {YOLO_BATCH_SIZE}')
+print(f'  MP threads : {MEDIAPIPE_THREADS}')
+print(f'  Max VLM events: {VLM_MAX_EVENTS}')
+
+# Local lazy Qwen loader. The Colab notebook loaded Qwen immediately; local UI loads it only during analysis.
+vlm_model = None
+vlm_processor = None
+process_vision_info = None
+
+def load_vlm_model():
+    global vlm_model, vlm_processor, process_vision_info
+    if not ENABLE_VLM:
+        return None, None, None
+    if vlm_model is not None and vlm_processor is not None:
+        return vlm_model, vlm_processor, process_vision_info
+    if not torch.cuda.is_available():
+        raise RuntimeError("ENABLE_VLM=1 but CUDA is not available. Set ENABLE_VLM=0 or install CUDA PyTorch.")
+    from transformers import AutoProcessor, BitsAndBytesConfig
+    from qwen_vl_utils import process_vision_info as _process_vision_info
+    try:
+        from transformers import Qwen2_5_VLForConditionalGeneration as _VLMClass
+    except ImportError:
+        from transformers import Qwen2VLForConditionalGeneration as _VLMClass
+
+    bnb = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.float16,
+        bnb_4bit_use_double_quant=True,
+    )
+    print(f"Loading {VLM_MODEL_ID} (4-bit NF4)...")
+    print(f"CUDA device: {torch.cuda.get_device_name(0)}")
+    vlm_model = _VLMClass.from_pretrained(
+        VLM_MODEL_ID,
+        quantization_config=bnb,
+        device_map='auto',
+        torch_dtype=torch.float16,
+        low_cpu_mem_usage=True,
+    )
+    vlm_model.eval()
+    vlm_processor = AutoProcessor.from_pretrained(VLM_MODEL_ID)
+    process_vision_info = _process_vision_info
+    used = torch.cuda.memory_allocated() / 1e9
+    total = torch.cuda.get_device_properties(0).total_memory / 1e9
+    print(f"VLM loaded. VRAM used: {used:.1f} GB / {total:.1f} GB")
+    return vlm_model, vlm_processor, process_vision_info
+
+# ── CELL 6: YOLO + MediaPipe initialisation ───────────────────────────────────
+import cv2, numpy as np, math, threading
+from ultralytics import YOLO
+import mediapipe as mp
+
+# YOLO models
+print('Loading YOLO models...')
+yolo_model = YOLO('yolov8s.pt')
+print('  yolov8s.pt loaded')
+
+brake_horn_model   = None
+BRAKE_HORN_AVAILABLE = False
+if BRAKE_HORN_MODEL_PATH and os.path.exists(BRAKE_HORN_MODEL_PATH):
+    brake_horn_model   = YOLO(BRAKE_HORN_MODEL_PATH)
+    BRAKE_HORN_AVAILABLE = True
+    print('  brake_horn_detection.pt loaded')
+else:
+    print('  WARNING: brake_horn_detection.pt not found — horn/brake detection unavailable')
+
+# MediaPipe FaceLandmarker (thread-local — one instance per worker thread)
+FaceLandmarker        = mp.tasks.vision.FaceLandmarker
+FaceLandmarkerOptions = mp.tasks.vision.FaceLandmarkerOptions
+VisionRunningMode     = mp.tasks.vision.RunningMode
+
+def _make_landmarker_options():
+    return FaceLandmarkerOptions(
+        base_options=mp.tasks.BaseOptions(model_asset_path=FACE_LANDMARKER_PATH),
+        running_mode=VisionRunningMode.IMAGE,
+        output_face_blendshapes=True,
+        output_facial_transformation_matrixes=True,
+        num_faces=4,
+        min_face_detection_confidence=0.25,
+        min_face_presence_confidence=0.25,
+        min_tracking_confidence=0.25,
+    )
+
+_thread_local = threading.local()
+
+def get_thread_landmarker():
+    """Return a thread-local FaceLandmarker (safe for concurrent use)."""
+    if not hasattr(_thread_local, 'lm'):
+        _thread_local.lm = FaceLandmarker.create_from_options(_make_landmarker_options())
+    return _thread_local.lm
+
+# Warm up main-thread instance
+_main_lm = FaceLandmarker.create_from_options(_make_landmarker_options())
+print(f'  MediaPipe FaceLandmarker ready ({MEDIAPIPE_THREADS} worker threads)')
+
+# CELL 8: Vision helper functions (EAR, MAR, head pose, face analysis)
 from PIL import Image
+
+LEFT_EYE_IDX  = [362, 385, 387, 263, 373, 380]
+RIGHT_EYE_IDX = [33, 160, 158, 133, 153, 144]
+SOLVEPNP_IDX  = [1, 152, 263, 33, 61, 291]
+BLENDSHAPE_KEYS = [
+    'eyeBlinkLeft','eyeBlinkRight','jawOpen',
+    'eyeLookDownLeft','eyeLookDownRight','eyeLookUpLeft','eyeLookUpRight',
+]
+
+MODEL_3D = np.array([
+    (0.,0.,0.), (0.,-330.,-65.), (-225.,170.,-135.),
+    (225.,170.,-135.), (-150.,-150.,-125.), (150.,-150.,-125.),
+], dtype=np.float64)
+
+def compute_ear(lm, idx):
+    try:
+        p = [(lm[i].x, lm[i].y) for i in idx]
+        h = math.dist(p[0], p[3])
+        return round((math.dist(p[1],p[5]) + math.dist(p[2],p[4])) / (2*h), 3) if h>1e-6 else 0.3
+    except Exception:
+        return None
+
+def compute_mar(lm):
+    try:
+        h = math.dist((lm[61].x,lm[61].y), (lm[291].x,lm[291].y))
+        if h < 1e-6: return 0.0
+        v1 = math.dist((lm[13].x,lm[13].y),  (lm[14].x,lm[14].y))
+        v2 = math.dist((lm[81].x,lm[81].y),  (lm[178].x,lm[178].y))
+        v3 = math.dist((lm[311].x,lm[311].y),(lm[402].x,lm[402].y))
+        return round((v1+v2+v3)/(3*h), 3)
+    except Exception:
+        return None
+
+def compute_head_pose(lm, w, h):
+    try:
+        pts2d = np.array([(lm[i].x*w, lm[i].y*h) for i in SOLVEPNP_IDX], dtype=np.float64)
+        cam   = np.array([[w,0,w/2],[0,w,h/2],[0,0,1]], dtype=np.float64)
+        ok, rvec, _ = cv2.solvePnP(MODEL_3D, pts2d, cam, np.zeros((4,1)), flags=cv2.SOLVEPNP_ITERATIVE)
+        if not ok: return {'pitch':0.,'yaw':0.,'pitch_label':'unknown','yaw_label':'unknown'}
+        angles,*_ = cv2.RQDecomp3x3(cv2.Rodrigues(rvec)[0])
+        pitch, yaw = round(angles[0],1), round(angles[1],1)
+        pl = 'drooping' if pitch<-15 else 'slight_down' if pitch<-8 else 'upright'
+        yl = ('turned_right' if yaw>0 else 'turned_left') if abs(yaw)>25 else 'forward'
+        return {'pitch':pitch,'yaw':yaw,'pitch_label':pl,'yaw_label':yl}
+    except Exception:
+        return {'pitch':0.,'yaw':0.,'pitch_label':'unknown','yaw_label':'unknown'}
+
+def get_blendshapes(bs_list):
+    return {b.category_name: round(b.score,3) for b in bs_list
+            if b.category_name in BLENDSHAPE_KEYS} if bs_list else {}
+
+def _run_landmarker_on_array(bgr_img, landmarker):
+    result = {'faces_detected': 0, 'face_analyses': []}
+    if bgr_img is None or bgr_img.size == 0:
+        return result
+    h, w = bgr_img.shape[:2]
+    rgb  = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2RGB)
+    try:
+        det = landmarker.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb))
+    except Exception:
+        return result
+    if not det.face_landmarks:
+        return result
+    result['faces_detected'] = len(det.face_landmarks)
+    for fi, face_lm in enumerate(det.face_landmarks):
+        el = compute_ear(face_lm, LEFT_EYE_IDX)
+        er = compute_ear(face_lm, RIGHT_EYE_IDX)
+        ear = round((el+er)/2, 3) if el and er else None
+        eye = 'CLOSED' if ear and ear<0.18 else 'PARTIALLY_CLOSED' if ear and ear<0.23 else 'OPEN'
+        mar = compute_mar(face_lm)
+        yawn= 'YAWNING' if mar and mar>0.6 else 'MOUTH_OPEN' if mar and mar>0.4 else 'NOT_YAWNING'
+        pose= compute_head_pose(face_lm, w, h)
+        bs  = get_blendshapes(det.face_blendshapes[fi] if det.face_blendshapes and fi<len(det.face_blendshapes) else [])
+        avg_blink = (bs.get('eyeBlinkLeft',0)+bs.get('eyeBlinkRight',0))/2
+        if avg_blink>0.6:  eye='CLOSED'
+        elif avg_blink>0.4 and eye=='OPEN': eye='PARTIALLY_CLOSED'
+        ld = (bs.get('eyeLookDownLeft',0)+bs.get('eyeLookDownRight',0))/2
+        lu = (bs.get('eyeLookUpLeft',0)+bs.get('eyeLookUpRight',0))/2
+        gaze = 'down' if ld>0.4 else 'up' if lu>0.4 else 'forward'
+        result['face_analyses'].append({
+            'ear_avg':ear, 'eye_status':eye, 'mar':mar, 'yawn_status':yawn,
+            'head_pitch_deg':pose['pitch'], 'head_yaw_deg':pose['yaw'],
+            'head_pitch':pose['pitch_label'], 'head_yaw':pose['yaw_label'],
+            'gaze_direction':gaze, 'blink_score':round(avg_blink,3), 'blendshapes':bs,
+            'face_quality': 'valid' if ear is not None else 'weak',
+        })
+    return result
+
+def _read_frame(frame_item):
+    if isinstance(frame_item, dict):
+        if frame_item.get('image') is not None:
+            return frame_item['image']
+        if frame_item.get('frame_path'):
+            return cv2.imread(frame_item['frame_path'])
+    if isinstance(frame_item, str):
+        return cv2.imread(frame_item)
+    return None
+
+def _run_landmarker_on_img(frame_item, landmarker):
+    return _run_landmarker_on_array(_read_frame(frame_item), landmarker)
+
+def analyze_face_on_crops(frame_item, yolo_dets, timestamp, landmarker):
+    merged = {'faces_detected':0, 'face_analyses':[]}
+    img = _read_frame(frame_item)
+    if img is None:
+        return merged
+    H, W = img.shape[:2]
+    persons = [d for d in yolo_dets if d['class_name']=='person' and d['confidence']>MEDIAPIPE_MIN_PERSON_CONF]
+    if not persons:
+        return _run_landmarker_on_array(img, landmarker)
+    for pi, p in enumerate(persons):
+        x1,y1,x2,y2 = p['bbox']
+        hy2 = y1 + int((y2-y1)*0.75)
+        px, py = int((x2-x1)*0.25), int((hy2-y1)*0.25)
+        cx1,cy1,cx2,cy2 = max(0,x1-px),max(0,y1-py),min(W,x2+px),min(H,hy2+py)
+        crop = img[cy1:cy2, cx1:cx2]
+        if crop.size==0:
+            continue
+        ch, cw = crop.shape[:2]
+        if cw<FACE_ROI_MIN_SIZE or ch<FACE_ROI_MIN_SIZE:
+            scale = max(FACE_ROI_MIN_SIZE/cw, FACE_ROI_MIN_SIZE/ch)
+            crop  = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        fd = _run_landmarker_on_array(crop, landmarker)
+        if fd['faces_detected']>0:
+            merged['faces_detected'] += fd['faces_detected']
+            for face in fd['face_analyses']:
+                face['person_bbox'] = p['bbox']
+                face['person_confidence'] = p['confidence']
+                merged['face_analyses'].append(face)
+    if merged['faces_detected']==0:
+        return _run_landmarker_on_array(img, landmarker)
+    return merged
+
+def smooth_face_metrics(frame_analyses, window=3):
+    vals = {'ear_avg': [], 'head_pitch_deg': [], 'head_yaw_deg': []}
+    for fa in frame_analyses:
+        faces = fa.get('face_analysis', {}).get('face_analyses', [])
+        best = faces[0] if faces else {}
+        for k in vals:
+            vals[k].append(best.get(k))
+    half = window // 2
+    for i, fa in enumerate(frame_analyses):
+        faces = fa.get('face_analysis', {}).get('face_analyses', [])
+        if not faces:
+            continue
+        for k in vals:
+            nearby = [vals[k][j] for j in range(max(0, i-half), min(len(vals[k]), i+half+1)) if vals[k][j] is not None]
+            if nearby:
+                faces[0][f'{k}_smooth'] = round(float(statistics.median(nearby)), 3)
+    return frame_analyses
+
+print('Vision helpers defined.')
+
+
+# CELL 9: Fast frame extraction with decord fallback + dense event decode
+def _sample_seconds(duration):
+    ivl = SAMPLE_INTERVAL
+    if duration // ivl > MAX_FRAMES:
+        ivl = max(1, duration // MAX_FRAMES)
+    dense_start = max(0, duration - END_DENSE_SECONDS)
+    seconds, seen = [], set()
+    for s in range(0, duration, ivl):
+        if s >= dense_start:
+            break
+        seconds.append(s); seen.add(s)
+        if len(seconds) >= MAX_FRAMES - END_DENSE_SECONDS:
+            break
+    for s in range(dense_start, duration):
+        if s not in seen:
+            seconds.append(s)
+    return seconds, ivl
+
+def _extract_frames_decord(video_path):
+    import decord
+    decord.bridge.set_bridge('native')
+    vr = decord.VideoReader(video_path, ctx=decord.cpu(0))
+    fps = int(round(vr.get_avg_fps())) or 30
+    total = len(vr)
+    dur = total // fps
+    sample_secs, ivl = _sample_seconds(dur)
+    frame_ids = [min(total-1, int(s*fps)) for s in sample_secs]
+    rgb_batch = vr.get_batch(frame_ids).asnumpy()
+    frames = []
+    for sec, rgb in zip(sample_secs, rgb_batch):
+        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        p = f'{FRAME_DIR}/frame_{sec}.jpg'
+        if WRITE_EXTRACTED_FRAMES:
+            t = time.time(); cv2.imwrite(p, bgr); PROFILER.add('jpeg_write_extracted', time.time()-t)
+            frame_path = p
+        else:
+            frame_path = None
+        frames.append({'timestamp': sec, 'frame_path': frame_path, 'image': bgr if KEEP_FRAMES_IN_MEMORY else None})
+    return frames, fps, dur, ivl
+
+def _extract_frames_opencv(video_path):
+    cap   = cv2.VideoCapture(video_path)
+    fps   = int(cap.get(cv2.CAP_PROP_FPS)) or 30
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    dur   = total // fps
+    sample_secs, ivl = _sample_seconds(dur)
+    frames = []
+    frame_idx = 0
+    for sec in sorted(sample_secs):
+        target = int(sec * fps)
+        while frame_idx < target:
+            ret = cap.grab()
+            if not ret:
+                break
+            frame_idx += 1
+        ret, frm = cap.read()
+        frame_idx += 1
+        if not ret:
+            break
+        p = f'{FRAME_DIR}/frame_{sec}.jpg'
+        if WRITE_EXTRACTED_FRAMES:
+            t = time.time(); cv2.imwrite(p, frm); PROFILER.add('jpeg_write_extracted', time.time()-t)
+            frame_path = p
+        else:
+            frame_path = None
+        frames.append({'timestamp': sec, 'frame_path': frame_path, 'image': frm if KEEP_FRAMES_IN_MEMORY else None})
+    cap.release()
+    return frames, fps, dur, ivl
+
+
+def extract_frames(video_path):
+    PROFILER.start('frame_decode')
+    decoder = 'decord'
+    decoder_error = None
+    try:
+        frames, fps, dur, ivl = _extract_frames_decord(video_path)
+    except Exception as e:
+        decoder_error = str(e)
+        decoder = 'opencv_sequential'
+        print(f'  decord unavailable/failed ({e}); using sequential OpenCV decode')
+        frames, fps, dur, ivl = _extract_frames_opencv(video_path)
+    PROFILER.stop({
+        'frames': len(frames), 'duration_s': dur, 'sample_interval_s': ivl,
+        'decoder': decoder, 'decoder_error': decoder_error,
+    })
+    print(f'  Extracted {len(frames)} frames from {dur}s video (interval={ivl}s, decoder={decoder}, in_memory={KEEP_FRAMES_IN_MEMORY})')
+    return frames, fps, dur
+
+
+def decode_frames_at_seconds(video_path, seconds):
+    """Decode sparse extra frames for event-level validation only."""
+    if not seconds:
+        return []
+    PROFILER.start('dense_event_decode')
+    cap = cv2.VideoCapture(video_path)
+    fps = int(cap.get(cv2.CAP_PROP_FPS)) or 30
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    out = []
+    for sec in sorted(set(int(s) for s in seconds if s >= 0)):
+        target = min(total - 1, int(sec * fps))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, target)
+        ret, frame = cap.read()
+        if ret:
+            out.append({'timestamp': sec, 'frame_path': None, 'image': frame, 'is_dense_event_frame': True})
+    cap.release()
+    PROFILER.stop({'requested': len(set(seconds)), 'decoded': len(out)})
+    return out
+
+def attach_dense_event_frames(video_path, event_candidates, duration):
+    """Attach +/- window frames to likely VLM candidates that need temporal visual context."""
+    dense_cache = {}
+    eligible = [c for c in event_candidates if c.needs_vlm and c.behavior in DENSE_EVENT_BEHAVIORS]
+    priority = {'alertness': 0, 'nap': 1, 'writing': 2, 'distraction': 3}
+    eligible.sort(key=lambda c: (priority.get(c.behavior, 99), -c.local_score))
+    eligible = eligible[:max(VLM_MAX_EVENTS, 8)]
+    for cand in eligible:
+        start = max(0, int(cand.start_ts) - DENSE_EVENT_WINDOW_SECONDS)
+        end = min(int(duration), int(cand.end_ts) + DENSE_EVENT_WINDOW_SECONDS)
+        step = max(1, int(1 / DENSE_EVENT_FPS)) if DENSE_EVENT_FPS < 1 else 1
+        seconds = list(range(start, end + 1, step))
+        missing = [s for s in seconds if s not in dense_cache]
+        for frame in decode_frames_at_seconds(video_path, missing):
+            dense_cache[frame['timestamp']] = frame
+        dense = [dense_cache[s] for s in seconds if s in dense_cache]
+        if dense:
+            cand.metadata['dense_seconds'] = [f['timestamp'] for f in dense]
+            cand.metadata['dense_frames'] = dense
+            cand.metadata['dense_window_s'] = [start, end]
+    PROFILER.events.append({'stage': 'dense_event_attachment', 'eligible': len(eligible), 'unique_dense_frames': len(dense_cache)})
+    return event_candidates
+
+def materialize_frame(frame_item):
+    if frame_item.get('frame_path') and os.path.exists(frame_item['frame_path']):
+        return frame_item['frame_path']
+    img = frame_item.get('image')
+    if img is None:
+        return None
+    p = f"{FRAME_DIR}/frame_{frame_item['timestamp']}.jpg"
+    t = time.time(); cv2.imwrite(p, img); PROFILER.add('jpeg_write_materialize', time.time()-t)
+    frame_item['frame_path'] = p
+    return p
+
+print('extract_frames() defined.')
+
+# CELL 10: Batched YOLO inference (GPU)
+def _ensure_yolo_sources(frames):
+    sources = []
+    for f in frames:
+        if isinstance(f, dict):
+            if KEEP_FRAMES_IN_MEMORY and f.get('image') is not None:
+                sources.append(f['image'])
+            else:
+                sources.append(materialize_frame(f))
+        else:
+            sources.append(f)
+    return sources
+
+def batch_yolo(frames_or_paths, model, class_map, conf=0.2, stage_name='yolo'):
+    out = {}
+    sources = _ensure_yolo_sources(frames_or_paths)
+    if not sources:
+        return out
+    try:
+        PROFILER.start(stage_name, sync_cuda=True)
+        gen = model.predict(source=sources, batch=YOLO_BATCH_SIZE, verbose=False, conf=conf, stream=True)
+        for i, r in enumerate(gen):
+            dets = []
+            for box in r.boxes:
+                cid = int(box.cls[0])
+                if cid in class_map:
+                    dets.append({
+                        'class_id': cid, 'class_name': class_map[cid],
+                        'confidence': round(float(box.conf[0]), 3),
+                        'bbox': [int(x) for x in box.xyxy[0].tolist()],
+                    })
+            out[i] = dets
+        PROFILER.stop({'frames': len(sources), 'batch': YOLO_BATCH_SIZE, 'conf': conf, 'in_memory': KEEP_FRAMES_IN_MEMORY})
+    except Exception as e:
+        if PROFILER.stage_stack:
+            PROFILER.stop({'error': str(e), 'fallback': True})
+        print(f'  Batch YOLO error ({e}), falling back to sequential...')
+        for i, source in enumerate(sources):
+            try:
+                t0 = time.time()
+                r = model(source, verbose=False, conf=conf)[0]
+                PROFILER.add(f'{stage_name}_sequential_frame', time.time()-t0)
+                out[i] = [{'class_id':int(b.cls[0]),'class_name':class_map[int(b.cls[0])],
+                            'confidence':round(float(b.conf[0]),3),
+                            'bbox':[int(x) for x in b.xyxy[0].tolist()]}
+                           for b in r.boxes if int(b.cls[0]) in class_map]
+            except Exception:
+                out[i] = []
+    return out
+
+print('batch_yolo() defined.')
+
+# CELL 11: Parallel MediaPipe + frame assembly, delayed annotation
+from concurrent.futures import ThreadPoolExecutor
+import time as _time
+
+def _worker_face(args):
+    idx, ts, frame_item, yolo_dets = args
+    lm = get_thread_landmarker()
+    return idx, analyze_face_on_crops(frame_item, yolo_dets, ts, lm)
+
+def create_annotated_frame(frame_item_or_path, all_dets, timestamp):
+    img = _read_frame(frame_item_or_path)
+    if img is None:
+        return frame_item_or_path if isinstance(frame_item_or_path, str) else materialize_frame(frame_item_or_path)
+    img = img.copy()
+    H, W = img.shape[:2]
+    CRITICAL = {'cell_phone','book','laptop','horn_active','brake_applied'}
+    for d in all_dets:
+        if d['confidence'] < 0.5:
+            continue
+        x1,y1,x2,y2 = d['bbox']
+        cls = d['class_name']
+        col = YOLO_COLORS.get(cls,(255,255,255))
+        th  = 3 if cls in CRITICAL else 2
+        cv2.rectangle(img,(x1,y1),(x2,y2),col,th)
+        lbl = f"{cls.upper() if cls in CRITICAL else cls} {d['confidence']:.0%}"
+        fs  = 0.55 if cls in CRITICAL else 0.45
+        (lw,lh),_ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, fs, 2)
+        ly = max(y1, lh+10)
+        cv2.rectangle(img,(x1,ly-lh-6),(x1+lw+6,ly+2),col,-1)
+        cv2.putText(img,lbl,(x1+3,ly-3),cv2.FONT_HERSHEY_SIMPLEX,fs,(255,255,255),2)
+    cv2.putText(img,f'T={timestamp}s',(5,H-8),cv2.FONT_HERSHEY_SIMPLEX,0.45,(0,255,255),1)
+    out = f'{ANNOTATED_DIR}/ann_{timestamp}.jpg'
+    t0 = _time.time(); cv2.imwrite(out, img); PROFILER.add('jpeg_write_annotation', _time.time()-t0)
+    return out
+
+def ensure_annotated_frame(frame_analyses, idx):
+    fa = frame_analyses[idx]
+    if fa.get('annotated_path') and os.path.exists(fa['annotated_path']):
+        return fa['annotated_path']
+    all_dets = fa.get('yolo_detections', []) + fa.get('brake_horn_detections', [])
+    fa['annotated_path'] = create_annotated_frame(fa.get('frame_item') or fa.get('frame_path'), all_dets, fa['timestamp'])
+    return fa['annotated_path']
+
+def save_evidence_image(frame_path, prefix):
+    if not frame_path or not os.path.exists(frame_path):
+        return None
+    filename = f"{prefix}_{int(_time.time()*1000)}.jpg"
+    out = f"{DETECTION_DIR}/{filename}"
+    import shutil; shutil.copy2(frame_path, out)
+    return f"/detections/{filename}"
+
+def _bbox_iou(a, b):
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0, ix2-ix1), max(0, iy2-iy1)
+    inter = iw * ih
+    area_a = max(1, (ax2-ax1) * (ay2-ay1))
+    area_b = max(1, (bx2-bx1) * (by2-by1))
+    return inter / (area_a + area_b - inter + 1e-6)
+
+def assign_person_tracks(frame_analyses, iou_threshold=0.25, max_missing=2):
+    """Lightweight tracker for sampled frames. Adds track_id to person detections and active_track_ids per frame."""
+    tracks = {}
+    next_id = 1
+    for idx, fa in enumerate(frame_analyses):
+        persons = [d for d in fa.get('yolo_detections', []) if d['class_name'] == 'person']
+        assigned_tracks = set()
+        active_ids = []
+        for det in sorted(persons, key=lambda d: -d['confidence']):
+            best_id, best_iou = None, 0.0
+            for tid, tr in tracks.items():
+                if idx - tr['last_seen'] > max_missing or tid in assigned_tracks:
+                    continue
+                iou = _bbox_iou(det['bbox'], tr['bbox'])
+                if iou > best_iou:
+                    best_id, best_iou = tid, iou
+            if best_id is None or best_iou < iou_threshold:
+                best_id = next_id
+                next_id += 1
+            det['track_id'] = best_id
+            tracks[best_id] = {'bbox': det['bbox'], 'last_seen': idx}
+            assigned_tracks.add(best_id)
+            active_ids.append(best_id)
+        fa['active_track_ids'] = sorted(active_ids)
+    return frame_analyses
+
+def run_full_local_analysis(frames):
+    print('  [1/3] Batched YOLO inference...')
+    yolo_res = batch_yolo(frames, yolo_model, YOLO_CLASSES, conf=0.2, stage_name='yolo_general')
+    bh_res   = batch_yolo(frames, brake_horn_model, BRAKE_HORN_CLASSES, conf=0.3, stage_name='yolo_brake_horn') if BRAKE_HORN_AVAILABLE else {i:[] for i in range(len(frames))}
+
+    print(f'  [2/3] Parallel MediaPipe ({MEDIAPIPE_THREADS} threads)...')
+    PROFILER.start('mediapipe_parallel')
+    args = [(i, frames[i]['timestamp'], frames[i], yolo_res.get(i,[])) for i in range(len(frames))]
+    face_res = {}
+    with ThreadPoolExecutor(max_workers=MEDIAPIPE_THREADS) as ex:
+        for idx, fd in ex.map(_worker_face, args):
+            face_res[idx] = fd
+    PROFILER.stop({'frames': len(frames), 'threads': MEDIAPIPE_THREADS})
+
+    print('  [3/3] Assembling frame data...')
+    PROFILER.start('frame_assembly')
+    frame_analyses = []
+    for i, f in enumerate(frames):
+        ts  = f['timestamp']
+        yd  = yolo_res.get(i,[])
+        bhd = bh_res.get(i,[])
+        fd  = face_res.get(i,{'faces_detected':0,'face_analyses':[]})
+        cnt = {}
+        for d in yd:
+            cnt[d['class_name']] = cnt.get(d['class_name'],0)+1
+        frame_analyses.append({
+            'timestamp':ts, 'frame_path':f.get('frame_path'), 'frame_item':f,
+            'annotated_path':None,
+            'yolo_detections':yd, 'brake_horn_detections':bhd,
+            'object_counts':cnt, 'person_count':cnt.get('person',0),
+            'phone_detected':'cell_phone' in cnt,
+            'bag_detected':any(k in cnt for k in ['backpack','handbag','suitcase']),
+            'book_detected':'book' in cnt,
+            'horn_active_detected':any(d['class_name']=='horn_active' for d in bhd),
+            'brake_applied_detected':any(d['class_name']=='brake_applied' for d in bhd),
+            'face_analysis':fd,
+        })
+    smooth_face_metrics(frame_analyses, window=3)
+    assign_person_tracks(frame_analyses)
+    PROFILER.stop({'frames': len(frame_analyses), 'person_tracks': max([max(f.get('active_track_ids', [0]) or [0]) for f in frame_analyses] or [0])})
+    return frame_analyses
+
+print('Parallel analysis functions defined.')
+
+# ── CELL 12: Tier 2 — Local rule-based parameter engine ───────────────────────
+# Report-focused revision: cleaner text, more conservative writing/mobile logic,
+# and zero-person consecutive-frame leaving detection.
+
+def find_max_consecutive(indices, total):
+    if not indices:
+        return 0
+    mx = cur = 1
+    for i in range(1, len(indices)):
+        if indices[i] == indices[i - 1] + 1:
+            cur += 1
+            mx = max(mx, cur)
+        else:
+            cur = 1
+    return mx
+
+def _runs_local(indices, max_gap=1):
+    indices = sorted(set(indices))
+    if not indices:
+        return []
+    runs = [[indices[0]]]
+    for idx in indices[1:]:
+        if idx - runs[-1][-1] <= max_gap:
+            runs[-1].append(idx)
+        else:
+            runs.append([idx])
+    return runs
+
+def _mid(lst):
+    return lst[len(lst) // 2] if lst else None
+
+def _event_duration(frame_analyses, indices):
+    if not indices:
+        return 0
+    return max(0, frame_analyses[indices[-1]]['timestamp'] - frame_analyses[indices[0]]['timestamp'])
+
+def _frame_hw_from_analysis(fa):
+    img = _read_frame(fa.get('frame_item') or fa.get('frame_path'))
+    if img is None:
+        return None, None
+    h, w = img.shape[:2]
+    return h, w
+
+def _actuator_run_stats(frame_analyses, run, class_name):
+    boxes, confs, centers = [], [], []
+    areas = []
+    for i in run:
+        dets = [d for d in frame_analyses[i].get('brake_horn_detections', []) if d['class_name'] == class_name]
+        if not dets:
+            continue
+        best = max(dets, key=lambda d: d['confidence'])
+        x1, y1, x2, y2 = best['bbox']
+        h, w = _frame_hw_from_analysis(frame_analyses[i])
+        if not h or not w:
+            continue
+        boxes.append(best['bbox'])
+        confs.append(float(best['confidence']))
+        centers.append(((x1 + x2) / 2.0 / w, (y1 + y2) / 2.0 / h))
+        areas.append(max(1.0, (x2 - x1) * (y2 - y1)) / float(w * h))
+    if not boxes:
+        return {
+            'detections': 0, 'max_conf': 0.0, 'mean_conf': 0.0, 'median_iou': 0.0,
+            'center_span_x': 1.0, 'center_span_y': 1.0, 'area_median': 0.0, 'stable': False,
+        }
+    pair_ious = [_bbox_iou(boxes[i - 1], boxes[i]) for i in range(1, len(boxes))]
+    xs = [c[0] for c in centers]
+    ys = [c[1] for c in centers]
+    area_sorted = sorted(areas)
+    return {
+        'detections': len(boxes),
+        'max_conf': max(confs),
+        'mean_conf': sum(confs) / len(confs),
+        'median_iou': sorted(pair_ious)[len(pair_ious) // 2] if pair_ious else 0.0,
+        'center_span_x': max(xs) - min(xs) if xs else 1.0,
+        'center_span_y': max(ys) - min(ys) if ys else 1.0,
+        'area_median': area_sorted[len(area_sorted) // 2] if area_sorted else 0.0,
+        'stable': False,
+    }
+
+def _actuator_is_stable(stats, behavior):
+    if stats['detections'] < 2:
+        return False
+    if behavior == 'brake_a9':
+        return (
+            stats['max_conf'] >= 0.78 and
+            stats['median_iou'] >= 0.22 and
+            stats['center_span_x'] <= 0.18 and
+            stats['center_span_y'] <= 0.18 and
+            0.0004 <= stats['area_median'] <= 0.08
+        )
+    return (
+        stats['max_conf'] >= 0.72 and
+        stats['median_iou'] >= 0.18 and
+        stats['center_span_x'] <= 0.22 and
+        stats['center_span_y'] <= 0.22 and
+        0.0004 <= stats['area_median'] <= 0.10
+    )
+
+def _stamp_parameter(param, frame_analyses, indices):
+    idx = _mid(indices)
+    param['evidence_frame_idx'] = idx
+    if idx is not None and 0 <= idx < len(frame_analyses):
+        param['evidence_timestamp_s'] = frame_analyses[idx].get('timestamp')
+        param['timestamp'] = f"{frame_analyses[idx].get('timestamp', 0)}s"
+    else:
+        param['evidence_timestamp_s'] = None
+        param['timestamp'] = 'N/A'
+    param['event_duration_s'] = _event_duration(frame_analyses, indices)
+    return param
+
+def compute_parameters_locally(frame_analyses):
+    total = len(frame_analyses)
+    if total == 0:
+        return {}, 'No frames available for analysis.', ''
+
+    eyes_closed, eyes_partial, head_droop = [], [], []
+    head_turned, gaze_down, yawning = [], [], []
+    phone_idx, bag_idx, book_idx = [], [], []
+    horn_idx, brake_idx = [], []
+    person_counts = []
+    all_yaw, all_pitch = [], []
+
+    for i, fa in enumerate(frame_analyses):
+        person_counts.append(fa['person_count'])
+        if fa['phone_detected']:
+            phone_idx.append(i)
+        if fa['bag_detected']:
+            bag_idx.append(i)
+        if fa['book_detected']:
+            book_idx.append(i)
+        if fa.get('horn_active_detected'):
+            horn_idx.append(i)
+        if fa.get('brake_applied_detected'):
+            brake_idx.append(i)
+        for f in fa['face_analysis']['face_analyses']:
+            es = f['eye_status']
+            if es == 'CLOSED':
+                eyes_closed.append(i)
+            elif es == 'PARTIALLY_CLOSED':
+                eyes_partial.append(i)
+            p = f.get('head_pitch_deg')
+            y = f.get('head_yaw_deg')
+            if p is not None:
+                all_pitch.append(p)
+            if y is not None:
+                all_yaw.append(y)
+            if p is not None and p < -25:
+                head_droop.append(i)
+            if f.get('gaze_direction') == 'down':
+                gaze_down.append(i)
+            if f.get('yawn_status') == 'YAWNING':
+                yawning.append(i)
+
+    base_yaw = sorted(all_yaw)[len(all_yaw) // 2] if all_yaw else 0.0
+    for i, fa in enumerate(frame_analyses):
+        for f in fa['face_analysis']['face_analyses']:
+            y = f.get('head_yaw_deg')
+            if y is not None and abs(y - base_yaw) > 30:
+                head_turned.append(i)
+
+    def dedup(lst):
+        return sorted(set(lst))
+
+    eyes_closed = dedup(eyes_closed)
+    eyes_partial = dedup(eyes_partial)
+    head_droop = dedup(head_droop)
+    head_turned = dedup(head_turned)
+    gaze_down = dedup(gaze_down)
+    yawning = dedup(yawning)
+    phone_idx = dedup(phone_idx)
+    bag_idx = dedup(bag_idx)
+    book_idx = dedup(book_idx)
+
+    all_impaired = dedup(eyes_closed + eyes_partial)
+    perclos = len(all_impaired) / max(1, total)
+    consec_closed = find_max_consecutive(eyes_closed, total)
+    consec_phone = find_max_consecutive(phone_idx, total)
+    zero_idx = [i for i, c in enumerate(person_counts) if c == 0]
+    zero_runs = _runs_local(zero_idx, max_gap=1)
+    longest_zero_run = max(zero_runs, key=len) if zero_runs else []
+
+    params = {}
+
+    dp = len(head_droop) / total
+    yp = len(yawning) / total
+    ascore = perclos * 0.5 + dp * 0.3 + yp * 0.2
+    ast = 'LOW' if ascore > 0.3 or perclos > 0.4 else 'MODERATE' if ascore > 0.12 or perclos > 0.15 else 'HIGH'
+    adesc = {
+        'LOW': 'Low. Extended periods of drooping head or closed eyes were observed.',
+        'MODERATE': 'Moderate. Occasional signs of reduced alertness were observed.',
+        'HIGH': 'High. Crew remained alert with upright posture in sampled frames.',
+    }[ast]
+    params['alertness'] = _stamp_parameter({
+        'key': 'alertness',
+        'label': 'Crew Alertness',
+        'icon': '',
+        'description': adesc,
+        'status': ast,
+        'confidence': 'HIGH' if total > 20 else 'MEDIUM',
+        'image_url': None,
+    }, frame_analyses, eyes_closed or head_droop or yawning)
+
+    dp2 = len(head_turned) / total
+    dst = 'HIGH' if dp2 > 0.3 else 'MODERATE' if dp2 > 0.15 else 'LOW' if dp2 > 0.08 else 'NONE'
+    ddesc = {
+        'HIGH': 'High. Crew frequently looked away from the forward view.',
+        'MODERATE': 'Moderate. Occasional head turns away from the forward view were observed.',
+        'LOW': 'Low. Minor head turns were observed and may be operational.',
+        'NONE': 'None. Crew maintained forward focus in sampled frames.',
+    }[dst]
+    params['distraction'] = _stamp_parameter({
+        'key': 'distraction',
+        'label': 'Crew Distraction',
+        'icon': '',
+        'description': ddesc,
+        'status': dst,
+        'confidence': 'HIGH' if total > 20 else 'MEDIUM',
+        'image_url': None,
+    }, frame_analyses, head_turned)
+
+    writing_focus = dedup(set(book_idx) & set(gaze_down))
+    consec_writing = find_max_consecutive(writing_focus, total)
+    if len(writing_focus) >= 3 and consec_writing >= 2:
+        wst, wc, wd = 'OBSERVED', 'MEDIUM', 'Observed. Sustained paperwork-focused activity consistent with writing was detected.'
+        writing_indices = writing_focus
+    elif len(book_idx) >= 2:
+        wst, wc, wd = 'NOT_OBSERVED', 'MEDIUM', 'Not Observed. Paper/document-like material was visible, but active writing was not confirmed.'
+        writing_indices = book_idx
+    elif len(book_idx) == 1:
+        wst, wc, wd = 'NOT_OBSERVED', 'LOW', 'Not Observed. A paper/document-like object was briefly visible, but active writing was not confirmed.'
+        writing_indices = book_idx
+    else:
+        wst, wc, wd = 'NOT_OBSERVED', 'HIGH', 'Not Observed. No sustained paperwork activity was detected.'
+        writing_indices = []
+    params['writing'] = _stamp_parameter({
+        'key': 'writing',
+        'label': 'Crew Doing Writing Work',
+        'icon': '',
+        'description': wd,
+        'status': wst,
+        'confidence': wc,
+        'image_url': None,
+        'writing_signal_frames': len(writing_focus),
+        'document_visible_frames': len(book_idx),
+    }, frame_analyses, writing_indices)
+
+    if consec_closed >= 5:
+        nst, nc, nd = 'OBSERVED', 'HIGH', 'Observed. Prolonged eye closure consistent with sleep was detected.'
+    elif consec_closed >= 3:
+        nst, nc, nd = 'OBSERVED', 'MEDIUM', 'Observed. Micro-sleep indicators were detected.'
+    elif perclos > 0.4:
+        nst, nc, nd = 'OBSERVED', 'MEDIUM', 'Observed. High PERCLOS suggests possible micro-sleep.'
+    else:
+        nst, nc, nd = 'NOT_OBSERVED', 'HIGH', 'Not Observed. No significant eye-closure pattern was detected.'
+    params['nap'] = _stamp_parameter({
+        'key': 'nap',
+        'label': 'Crew Taking Nap / Micro-sleep',
+        'icon': '',
+        'description': nd,
+        'status': nst,
+        'confidence': nc,
+        'image_url': None,
+    }, frame_analyses, eyes_closed)
+
+    if len(phone_idx) >= 3 and consec_phone >= 2:
+        mst, mc, md = 'OBSERVED', 'HIGH', 'Observed. Sustained mobile phone handling/use was detected.'
+        mobile_indices = phone_idx
+    elif len(phone_idx) >= 1:
+        mst, mc, md = 'NOT_OBSERVED', 'MEDIUM' if len(phone_idx) >= 2 else 'LOW', 'Not Observed. A phone-like object was visible, but active use was not confirmed.'
+        mobile_indices = phone_idx
+    else:
+        mst, mc, md = 'NOT_OBSERVED', 'HIGH', 'Not Observed. No phone-like object or active phone use was detected.'
+        mobile_indices = []
+    params['mobile'] = _stamp_parameter({
+        'key': 'mobile',
+        'label': 'Crew Using Mobile',
+        'icon': '',
+        'description': md,
+        'status': mst,
+        'confidence': mc,
+        'image_url': None,
+        'phone_visible_frames': len(phone_idx),
+    }, frame_analyses, mobile_indices)
+
+    if bag_idx:
+        pst, pc, pd = 'NOT_OBSERVED', 'LOW', 'Not Observed. Bags/personal items were visible but no active packing was confirmed.'
+    else:
+        pst, pc, pd = 'NOT_OBSERVED', 'HIGH', 'Not Observed. No bags or personal items were detected.'
+    params['packing'] = _stamp_parameter({
+        'key': 'packing',
+        'label': 'Crew Packing Belongings',
+        'icon': '',
+        'description': pd,
+        'status': pst,
+        'confidence': pc,
+        'image_url': None,
+    }, frame_analyses, bag_idx)
+
+    baseline_people_seen = sum(1 for c in person_counts[:min(10, total)] if c > 0)
+    if baseline_people_seen >= 2 and len(longest_zero_run) >= 3:
+        lst = 'OBSERVED'
+        lc = 'HIGH' if len(longest_zero_run) >= 5 else 'MEDIUM'
+        ld = f'Observed. Person count remained 0 for {len(longest_zero_run)} consecutive sampled frames, consistent with crew leaving position.'
+        leaving_indices = longest_zero_run
+    elif baseline_people_seen >= 2 and len(longest_zero_run) == 2:
+        lst, lc = 'NOT_OBSERVED', 'LOW'
+        ld = 'Not Observed. Brief empty-cabin frames were seen, but the run was too short to confirm leaving position.'
+        leaving_indices = longest_zero_run
+    elif baseline_people_seen >= 2:
+        lst, lc, ld = 'NOT_OBSERVED', 'HIGH', 'Not Observed. The cabin did not remain empty for enough consecutive sampled frames to confirm leaving position.'
+        leaving_indices = []
+    else:
+        lst, lc, ld = 'NOT_OBSERVED', 'LOW', 'Insufficient stable crew presence was available before empty-cabin checks.'
+        leaving_indices = []
+    params['leaving'] = _stamp_parameter({
+        'key': 'leaving',
+        'label': 'Crew Leaving Place',
+        'icon': '',
+        'description': ld,
+        'status': lst,
+        'confidence': lc,
+        'image_url': None,
+        'zero_person_run_frames': len(longest_zero_run),
+    }, frame_analyses, leaving_indices)
+
+    horn_idx = dedup(horn_idx)
+    horn_runs = _runs_local(horn_idx, max_gap=1)
+    horn_eval = [(run, _actuator_run_stats(frame_analyses, run, 'horn_active')) for run in horn_runs]
+    best_horn_run, best_horn_stats = max(
+        horn_eval,
+        key=lambda item: (item[1]['stable'], len(item[0]), item[1]['max_conf'], item[1]['median_iou']),
+        default=([], {'stable': False, 'detections': 0, 'max_conf': 0.0, 'median_iou': 0.0}),
+    )
+    if best_horn_run:
+        best_horn_stats['stable'] = _actuator_is_stable(best_horn_stats, 'horn')
+    ch2 = len(best_horn_run)
+    if best_horn_stats.get('stable') and len(best_horn_run) >= 4:
+        hst, hc = 'OBSERVED', 'HIGH'
+    elif best_horn_stats.get('stable') and len(best_horn_run) >= 3:
+        hst, hc = 'OBSERVED', 'MEDIUM'
+    elif horn_idx:
+        hst, hc = 'NOT_OBSERVED', 'LOW'
+    else:
+        hst, hc = 'NOT_OBSERVED', 'HIGH' if BRAKE_HORN_AVAILABLE else 'LOW'
+    hd = (
+        f'Observed. Horn lever activity was detected in {len(horn_idx)} sampled frames ({ch2} consecutive).'
+        if hst == 'OBSERVED' else
+        ('Not Observed. Brief horn-like detections were seen, but temporal support was insufficient to confirm operation.'
+         if horn_idx else 'Not Observed. No horn activation was detected by the custom YOLO model.')
+    )
+    params['horn'] = _stamp_parameter({
+        'key': 'horn',
+        'label': 'Crew Operating Horn Lever/Switch',
+        'icon': '',
+        'description': hd,
+        'status': hst,
+        'confidence': hc,
+        'image_url': None,
+        'temporal_run_frames': len(best_horn_run),
+        'detector_max_confidence': round(best_horn_stats.get('max_conf', 0.0), 3),
+        'spatially_stable': bool(best_horn_stats.get('stable')),
+    }, frame_analyses, best_horn_run or horn_idx)
+
+    brake_idx = dedup(brake_idx)
+    brake_runs = _runs_local(brake_idx, max_gap=1)
+    brake_eval = [(run, _actuator_run_stats(frame_analyses, run, 'brake_applied')) for run in brake_runs]
+    best_brake_run, best_brake_stats = max(
+        brake_eval,
+        key=lambda item: (item[1]['stable'], len(item[0]), item[1]['max_conf'], item[1]['median_iou']),
+        default=([], {'stable': False, 'detections': 0, 'max_conf': 0.0, 'median_iou': 0.0}),
+    )
+    if best_brake_run:
+        best_brake_stats['stable'] = _actuator_is_stable(best_brake_stats, 'brake_a9')
+    cb2 = len(best_brake_run)
+    if best_brake_stats.get('stable') and len(best_brake_run) >= 4:
+        bst, bcc = 'OBSERVED', 'HIGH'
+    elif best_brake_stats.get('stable') and len(best_brake_run) >= 3:
+        bst, bcc = 'OBSERVED', 'MEDIUM'
+    elif brake_idx:
+        bst, bcc = 'NOT_OBSERVED', 'LOW'
+    else:
+        bst, bcc = 'NOT_OBSERVED', 'HIGH' if BRAKE_HORN_AVAILABLE else 'LOW'
+    bd = (
+        f'Observed. A9/SA9 brake activity was detected in {len(brake_idx)} sampled frames ({cb2} consecutive).'
+        if bst == 'OBSERVED' else
+        ('Not Observed. Brief brake-handle detections were seen, but temporal support was insufficient to confirm application.'
+         if brake_idx else 'Not Observed. No A9/SA9 brake activity was detected by the custom YOLO model.')
+    )
+    params['brake_a9'] = _stamp_parameter({
+        'key': 'brake_a9',
+        'label': 'LP Applying A9/SA9 After Halt',
+        'icon': '',
+        'description': bd,
+        'status': bst,
+        'confidence': bcc,
+        'image_url': None,
+        'temporal_run_frames': len(best_brake_run),
+        'detector_max_confidence': round(best_brake_stats.get('max_conf', 0.0), 3),
+        'spatially_stable': bool(best_brake_stats.get('stable')),
+    }, frame_analyses, best_brake_run or brake_idx)
+
+    for key, param in params.items():
+        idx = param.get('evidence_frame_idx')
+        st = param.get('status', '')
+        if st in ('NOT_OBSERVED', 'NONE') or (key == 'alertness' and st == 'HIGH'):
+            param['evidence_frame_idx'] = None
+            continue
+        if idx is not None and 0 <= idx < total:
+            src = frame_analyses[idx].get('annotated_path', frame_analyses[idx]['frame_path'])
+            param['image_url'] = save_evidence_image(src, key)
+
+    issues = []
+    if params['alertness']['status'] == 'LOW':
+        issues.append('low alertness')
+    elif params['alertness']['status'] == 'MODERATE':
+        issues.append('moderate alertness')
+    if params['nap']['status'] == 'OBSERVED':
+        issues.append('napping/micro-sleep')
+    if params['mobile']['status'] == 'OBSERVED':
+        issues.append('mobile phone use')
+    if params['distraction']['status'] in ('HIGH', 'MODERATE', 'OBSERVED'):
+        issues.append('distraction')
+    if params['leaving']['status'] == 'OBSERVED':
+        issues.append('crew left position')
+    if params['writing']['status'] == 'OBSERVED':
+        issues.append('writing during duty')
+    if params['packing']['status'] == 'OBSERVED':
+        issues.append('packing belongings')
+    if params['horn']['status'] == 'OBSERVED':
+        issues.append('horn operation')
+    if params['brake_a9']['status'] == 'OBSERVED':
+        issues.append('A9/SA9 brake')
+
+    summary = f"Flagged {len(issues)} concern(s): {', '.join(issues)}. Review recommended." if issues else 'Safe crew behaviour. No critical violations.'
+    recs = []
+    if params['alertness']['status'] != 'HIGH':
+        recs.append('- Monitor alertness indicators around the evidence timestamp.')
+    if params['mobile']['status'] == 'OBSERVED':
+        recs.append('- Review the mobile-use interval and enforce no-phone policy if confirmed.')
+    if params['leaving']['status'] == 'OBSERVED':
+        recs.append('- Review the empty-cabin interval to confirm crew leaving position.')
+    if params['writing']['status'] == 'OBSERVED':
+        recs.append('- Verify whether paperwork handling was operationally required.')
+    if params['brake_a9']['status'] == 'OBSERVED':
+        recs.append('- Confirm that A9/SA9 brake application matches procedure.')
+    if not recs:
+        recs.append('- Behaviour compliant. Continue monitoring.')
+    return params, summary, '\n'.join(recs)
+
+
+
+# CELL 13: Event candidate generation + reserved VLM event selection
+def _runs(indices, max_gap=1):
+    indices = sorted(set(indices))
+    if not indices:
+        return []
+    runs, cur = [], [indices[0]]
+    for idx in indices[1:]:
+        if idx - cur[-1] <= max_gap:
+            cur.append(idx)
+        else:
+            runs.append(cur)
+            cur = [idx]
+    runs.append(cur)
+    return runs
+
+def _ts(frame_analyses, idx):
+    return frame_analyses[idx]['timestamp']
+
+def _mid(run):
+    return run[len(run) // 2] if run else None
+
+def _det_conf(fa, names, source='yolo_detections'):
+    vals = [d['confidence'] for d in fa.get(source, []) if d['class_name'] in names]
+    return max(vals) if vals else 0.0
+
+def _frame_hw_from_analysis(fa):
+    img = _read_frame(fa.get('frame_item') or fa.get('frame_path'))
+    if img is None:
+        return None, None
+    h, w = img.shape[:2]
+    return h, w
+
+def _actuator_run_stats(frame_analyses, run, class_name):
+    boxes, confs, centers = [], [], []
+    areas = []
+    for i in run:
+        dets = [d for d in frame_analyses[i].get('brake_horn_detections', []) if d['class_name'] == class_name]
+        if not dets:
+            continue
+        best = max(dets, key=lambda d: d['confidence'])
+        x1, y1, x2, y2 = best['bbox']
+        h, w = _frame_hw_from_analysis(frame_analyses[i])
+        if not h or not w:
+            continue
+        boxes.append(best['bbox'])
+        confs.append(float(best['confidence']))
+        centers.append(((x1 + x2) / 2.0 / w, (y1 + y2) / 2.0 / h))
+        areas.append(max(1.0, (x2 - x1) * (y2 - y1)) / float(w * h))
+    if not boxes:
+        return {
+            'detections': 0, 'max_conf': 0.0, 'mean_conf': 0.0, 'median_iou': 0.0,
+            'center_span_x': 1.0, 'center_span_y': 1.0, 'area_median': 0.0, 'stable': False,
+        }
+    pair_ious = [_bbox_iou(boxes[i - 1], boxes[i]) for i in range(1, len(boxes))]
+    xs = [c[0] for c in centers]
+    ys = [c[1] for c in centers]
+    area_sorted = sorted(areas)
+    return {
+        'detections': len(boxes),
+        'max_conf': max(confs),
+        'mean_conf': sum(confs) / len(confs),
+        'median_iou': sorted(pair_ious)[len(pair_ious) // 2] if pair_ious else 0.0,
+        'center_span_x': max(xs) - min(xs) if xs else 1.0,
+        'center_span_y': max(ys) - min(ys) if ys else 1.0,
+        'area_median': area_sorted[len(area_sorted) // 2] if area_sorted else 0.0,
+        'stable': False,
+    }
+
+def _actuator_is_stable(stats, behavior):
+    if stats['detections'] < 2:
+        return False
+    if behavior == 'brake_a9':
+        return (
+            stats['max_conf'] >= 0.78 and
+            stats['median_iou'] >= 0.22 and
+            stats['center_span_x'] <= 0.18 and
+            stats['center_span_y'] <= 0.18 and
+            0.0004 <= stats['area_median'] <= 0.08
+        )
+    return (
+        stats['max_conf'] >= 0.72 and
+        stats['median_iou'] >= 0.18 and
+        stats['center_span_x'] <= 0.22 and
+        stats['center_span_y'] <= 0.22 and
+        0.0004 <= stats['area_median'] <= 0.10
+    )
+
+def _add_candidate(cands, frame_analyses, behavior, run, score, reason, needs_vlm=False, metadata=None):
+    if not run:
+        return
+    tids = sorted({tid for i in run for tid in frame_analyses[i].get('active_track_ids', [])})
+    cands.append(EventCandidate(
+        behavior=behavior,
+        start_ts=_ts(frame_analyses, run[0]),
+        end_ts=_ts(frame_analyses, run[-1]),
+        frame_indices=list(run),
+        track_ids=tids,
+        local_score=round(float(max(0.0, min(1.0, score))), 3),
+        final_score=round(float(max(0.0, min(1.0, score))), 3),
+        evidence_frame=_mid(run),
+        reason=reason,
+        needs_vlm=needs_vlm,
+        metadata=metadata or {},
+    ))
+
+def _paper_roi_signal(frame_item):
+    img = _read_frame(frame_item)
+    if img is None:
+        return 0.0
+    h, w = img.shape[:2]
+    roi = img[int(h * 0.45):int(h * 0.92), int(w * 0.05):int(w * 0.58)]
+    if roi.size == 0:
+        return 0.0
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    bright = (hsv[:, :, 2] > 145).mean()
+    low_sat = (hsv[:, :, 1] < 90).mean()
+    edges = cv2.Canny(cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY), 60, 140).mean() / 255.0
+    return float(min(1.0, 0.45 * bright + 0.35 * low_sat + 0.60 * edges))
+
+def _body_attention_signal(fa):
+    persons = [d for d in fa.get('yolo_detections', []) if d['class_name'] == 'person']
+    if not persons:
+        return 0.0
+    p = max(persons, key=lambda d: d['confidence'])
+    x1, y1, x2, y2 = p['bbox']
+    width = max(1, x2 - x1)
+    height = max(1, y2 - y1)
+    aspect = height / width
+    conf = p['confidence']
+    return float(min(1.0, 0.28 + 0.35 * conf + (0.12 if aspect < 1.8 else 0.0)))
+
+def build_event_candidates(frame_analyses, local_params):
+    total = len(frame_analyses)
+    if total == 0:
+        return []
+    cands = []
+    face_valid = [i for i, fa in enumerate(frame_analyses) if fa['face_analysis']['faces_detected'] > 0]
+    face_rate = len(face_valid) / max(1, total)
+    closed = [i for i, fa in enumerate(frame_analyses) if any(f['eye_status'] == 'CLOSED' for f in fa['face_analysis']['face_analyses'])]
+    partial = [i for i, fa in enumerate(frame_analyses) if any(f['eye_status'] == 'PARTIALLY_CLOSED' for f in fa['face_analysis']['face_analyses'])]
+    yawning = [i for i, fa in enumerate(frame_analyses) if any(f.get('yawn_status') in ('YAWNING', 'MOUTH_OPEN') for f in fa['face_analysis']['face_analyses'])]
+    all_yaw = [f.get('head_yaw_deg_smooth', f.get('head_yaw_deg')) for fa in frame_analyses for f in fa['face_analysis']['face_analyses'] if f.get('head_yaw_deg') is not None]
+    base_yaw = sorted(all_yaw)[len(all_yaw) // 2] if all_yaw else 0
+    turned = [i for i, fa in enumerate(frame_analyses) if any(abs(f.get('head_yaw_deg_smooth', f.get('head_yaw_deg', base_yaw)) - base_yaw) > 30 for f in fa['face_analysis']['face_analyses'])]
+    phone = [i for i, fa in enumerate(frame_analyses) if fa['phone_detected']]
+    book = [i for i, fa in enumerate(frame_analyses) if fa['book_detected']]
+    bag = [i for i, fa in enumerate(frame_analyses) if fa['bag_detected']]
+    gaze_down = [i for i, fa in enumerate(frame_analyses) if any(f.get('gaze_direction') == 'down' for f in fa['face_analysis']['face_analyses'])]
+    horn = [i for i, fa in enumerate(frame_analyses) if fa.get('horn_active_detected')]
+    brake = [i for i, fa in enumerate(frame_analyses) if fa.get('brake_applied_detected')]
+    person_c = [fa['person_count'] for fa in frame_analyses]
+    zero_person = [i for i, c in enumerate(person_c) if c == 0]
+    baseline_people_seen = sum(1 for c in person_c[:min(10, total)] if c > 0)
+
+    face_den = max(1, len(face_valid))
+    perclos = len(set(closed + partial)) / face_den
+    for run in _runs(closed, max_gap=1):
+        score = min(1.0, 0.35 + 0.13 * len(run) + 0.35 * perclos)
+        _add_candidate(cands, frame_analyses, 'nap', run, score, 'closed-eye temporal run', needs_vlm=(0.35 <= score <= 0.85), metadata={'face_rate': round(face_rate, 3)})
+    for run in _runs(yawning, max_gap=1):
+        score = min(1.0, 0.42 + 0.10 * len(run))
+        _add_candidate(cands, frame_analyses, 'attention_state', run, score, 'possible yawning / reduced alertness attention event', needs_vlm=True, metadata={'attention_hint': 'yawn', 'face_rate': round(face_rate, 3)})
+    if not closed and perclos > 0.18:
+        _add_candidate(cands, frame_analyses, 'attention_state', partial[:5], min(0.8, perclos + 0.20), 'elevated PERCLOS from valid face frames', needs_vlm=True, metadata={'attention_hint': 'perclos', 'face_rate': round(face_rate, 3)})
+
+    for run in _runs(turned, max_gap=1):
+        score = min(0.72, 0.20 + 0.08 * len(run) + len(turned) / max(1, total))
+        _add_candidate(cands, frame_analyses, 'attention_state', run, score, 'head/body attention state requires operational-context VLM classification', needs_vlm=True, metadata={'attention_hint': 'head_yaw', 'head_yaw_only': True, 'face_rate': round(face_rate, 3)})
+
+    if face_rate < 0.08:
+        person_present = [i for i, fa in enumerate(frame_analyses) if fa['person_count'] > 0 and _body_attention_signal(fa) > 0.45]
+        for run in _runs(person_present, max_gap=2):
+            if len(run) < 2:
+                continue
+            step = max(2, len(run) // 3)
+            for start in range(0, len(run), step):
+                sub = run[start:start + step]
+                if len(sub) >= 2:
+                    score = min(0.66, 0.38 + 0.025 * len(sub))
+                    _add_candidate(cands, frame_analyses, 'attention_state', sub, score, 'MediaPipe sparse; classify operational control-check vs distraction vs reduced alertness', needs_vlm=True, metadata={'attention_hint': 'body_orientation', 'face_rate': round(face_rate, 3)})
+                if start >= step * 2:
+                    break
+
+    for run in _runs(phone, max_gap=1):
+        conf = max(_det_conf(frame_analyses[i], {'cell_phone'}) for i in run)
+        score = min(1.0, 0.22 + 0.16 * len(run) + 0.40 * conf)
+        _add_candidate(cands, frame_analyses, 'mobile', run, score, 'phone-like object visible; verify active holding/use across the sequence', needs_vlm=True, metadata={'max_yolo_conf': conf, 'phone_visible_frames': len(run)})
+
+    paper_like = [i for i, fa in enumerate(frame_analyses) if _paper_roi_signal(fa.get('frame_item') or fa.get('frame_path')) > 0.48]
+    writing_seed = sorted((set(book) & set(gaze_down)) | (set(paper_like) & set(gaze_down)) | (set(book) & set(paper_like)))
+    for run in _runs(writing_seed, max_gap=2):
+        conf = max([_det_conf(frame_analyses[i], {'book', 'laptop'}) for i in run] or [0.0])
+        gaze_overlap = len(set(run) & set(gaze_down)) / max(1, len(run))
+        paper_score = max([_paper_roi_signal(frame_analyses[i].get('frame_item') or frame_analyses[i].get('frame_path')) for i in run] or [0.0])
+        if len(run) < 2 and paper_score < 0.72:
+            continue
+        score = min(1.0, 0.18 + 0.09 * len(run) + 0.18 * conf + 0.28 * gaze_overlap + 0.28 * paper_score)
+        _add_candidate(cands, frame_analyses, 'writing', run, score, 'paper/document visible with sustained downward attention; verify active writing versus normal console interaction', needs_vlm=True, metadata={'max_yolo_conf': conf, 'gaze_overlap': round(gaze_overlap, 2), 'paper_score': round(paper_score, 2), 'writing_signal_frames': len(run)})
+
+    for run in _runs(bag, max_gap=2):
+        score = min(0.65, 0.20 + 0.06 * len(run))
+        _add_candidate(cands, frame_analyses, 'packing', run, score, 'bag/belonging visible; VLM must distinguish static vs active handling', needs_vlm=True)
+
+    if baseline_people_seen >= 2:
+        for run in _runs(zero_person, max_gap=1):
+            if len(run) < 2:
+                continue
+            score = min(1.0, 0.32 + 0.15 * len(run))
+            _add_candidate(cands, frame_analyses, 'leaving', run, score, f'cab empty (0 persons) for {len(run)} consecutive frames', needs_vlm=(len(run) < 4), metadata={'zero_person_run_frames': len(run), 'baseline_people_seen': baseline_people_seen})
+
+    for behavior, idxs, src_name in [('horn', horn, 'horn_active'), ('brake_a9', brake, 'brake_applied')]:
+        for run in _runs(idxs, max_gap=1):
+            stats = _actuator_run_stats(frame_analyses, run, src_name)
+            stats['stable'] = _actuator_is_stable(stats, behavior)
+            conf = stats['max_conf']
+            stability_bonus = 0.10 if stats['stable'] else -0.18
+            score = min(1.0, 0.10 + 0.12 * len(run) + 0.45 * conf + 0.20 * stats['median_iou'] + stability_bonus)
+            reason = (
+                f'custom YOLO {src_name} run with {len(run)} frames, max confidence {conf:.2f}, '
+                f'median IoU {stats["median_iou"]:.2f}, stable={stats["stable"]}'
+            )
+            if behavior == 'brake_a9' and not stats['stable'] and len(run) < 4:
+                continue
+            _add_candidate(
+                cands,
+                frame_analyses,
+                behavior,
+                run,
+                score,
+                reason,
+                needs_vlm=(not stats['stable'] or len(run) < 3 or conf < 0.78 or score < 0.68),
+                metadata={
+                    'max_yolo_conf': conf,
+                    'temporal_run_frames': len(run),
+                    'median_iou': round(stats['median_iou'], 3),
+                    'center_span_x': round(stats['center_span_x'], 3),
+                    'center_span_y': round(stats['center_span_y'], 3),
+                    'area_median': round(stats['area_median'], 4),
+                    'spatially_stable': bool(stats['stable']),
+                },
+            )
+
+    behavior_priority = {'attention_state': 0, 'alertness': 1, 'nap': 2, 'writing': 3, 'mobile': 4, 'leaving': 5, 'horn': 6, 'brake_a9': 7, 'packing': 8, 'distraction': 9}
+    cands.sort(key=lambda c: (not c.needs_vlm, behavior_priority.get(c.behavior, 99), -c.local_score))
+    print(f'  Event candidates: {len(cands)} total, {sum(c.needs_vlm for c in cands)} need VLM')
+    for c in cands[:14]:
+        tag = 'VLM' if c.needs_vlm else 'LOCAL'
+        print(f'    [{tag}] {c.behavior}: t={c.start_ts}-{c.end_ts}s frames={c.frame_indices} local={c.local_score}')
+    return cands
+
+def select_vlm_events(event_candidates):
+    selected, seen_ids = [], set()
+    def add_for(behavior, limit):
+        added = 0
+        for c in event_candidates:
+            if added >= limit or len(selected) >= VLM_MAX_EVENTS:
+                break
+            if not c.needs_vlm or c.behavior != behavior or id(c) in seen_ids:
+                continue
+            selected.append(c)
+            seen_ids.add(id(c))
+            added += 1
+    add_for('attention_state', 3)
+    add_for('nap', 1)
+    add_for('writing', 2)
+    add_for('mobile', 1)
+    for behavior in ('leaving', 'horn', 'brake_a9', 'packing'):
+        add_for(behavior, VLM_MAX_EVENTS)
+    slot_usage = {}
+    for c in selected:
+        slot_usage[c.behavior] = slot_usage.get(c.behavior, 0) + 1
+        c.metadata['vlm_slot_reserved'] = True
+    print(f'  VLM event selection: {len(selected)}/{len(event_candidates)} candidates; slots={slot_usage}')
+    PROFILER.events.append({'stage': 'vlm_slot_selection', 'slots': slot_usage, 'selected': len(selected)})
+    return selected
+
+def select_vlm_frames(frame_analyses, local_params):
+    return {c.evidence_frame: [c.behavior] for c in select_vlm_events(build_event_candidates(frame_analyses, local_params)) if c.evidence_frame is not None}
+
+print('Event candidate selection defined.')
+
+
+
+
+# CELL 14: Event-level VLM analysis + calibrated fusion/evidence mapping
+import re
+
+BEHAVIOR_TO_PARAM = {
+    'alertness': 'alertness', 'distraction': 'distraction', 'writing': 'writing', 'nap': 'nap',
+    'mobile': 'mobile', 'packing': 'packing', 'leaving': 'leaving', 'horn': 'horn', 'brake_a9': 'brake_a9',
+}
+VLM_TASK_RULES = {
+    'attention_state': 'Classify crew attention state across the sequence. Use one of: alert, reduced_alertness, yawning, drowsy, normal_control_check, writing, non_operational_distraction, uncertain. Normal checking/operating instrument panels and controls is NOT distraction.',
+    'mobile': 'Decide whether a crew member is actively holding or using a mobile phone. Do not count reflective handles, radios, controls, or phone-like objects not in hand.',
+    'writing': 'Use the sequence. Decide whether the hand is writing/marking paperwork for several seconds versus merely operating controls or touching a console.',
+    'packing': 'Decide whether a crew member is actively gathering/packing belongings. A stationary bag alone is NO.',
+    'leaving': 'Decide whether a crew member vacated the expected seat/position. Temporary occlusion or detector miss is UNCERTAIN/NO.',
+    'nap': 'Classify the sequence as blink, yawn, microsleep, sleep, or none. Treat repeated yawning/long mouth-open as alertness evidence; treat sustained closed eyes/head droop as microsleep/sleep.',
+    'distraction': 'Decide whether attention is away from track/controls for a sustained non-operational reason. Normal instrument/control-panel checking is NO or normal_control_check.',
+    'horn': 'Decide whether the horn lever/switch is actually being operated. Prefer local custom detector if visible.',
+    'brake_a9': 'Decide whether A9/SA9 brake handle is being applied. Prefer local custom detector if visible.',
+    'alertness': 'Assess alertness from yawning, posture, eyes, and engagement with controls. Report yawn/mouth-open separately from microsleep.',
+}
+ATTENTION_STATES = {
+    'alert', 'reduced_alertness', 'yawning', 'drowsy', 'normal_control_check',
+    'writing', 'non_operational_distraction', 'uncertain'
+}
+
+def _safe_json(text):
+    text = text.strip()
+    m = re.search(r'\{.*\}', text, flags=re.DOTALL)
+    if m:
+        text = m.group(0)
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    low = text.lower()
+    subtype = None
+    for state in list(ATTENTION_STATES) + ['blink', 'microsleep', 'sleep', 'none']:
+        if state in low:
+            subtype = state
+            break
+    decision = 'uncertain'
+    if re.search(r'\byes\b|observed|active|microsleep|sleep|yawn|drowsy|reduced_alertness|non_operational_distraction|writing', low):
+        decision = 'yes'
+    if re.search(r'\bno\b|not observed|not active|none|normal_control_check|alert', low):
+        decision = 'no' if subtype in (None, 'none', 'normal_control_check', 'alert') else decision
+    return {'decision': decision, 'confidence_0_1': 0.45, 'evidence_image': 1, 'subtype': subtype, 'attention_state': subtype, 'reason': text[:180]}
+
+def _frame_cv_summary(fa):
+    dets = []
+    for d in fa.get('yolo_detections', []) + fa.get('brake_horn_detections', []):
+        if d['class_name'] != 'person':
+            dets.append(f"{d['class_name']}:{d['confidence']:.2f}@{d['bbox']}")
+    face_bits = []
+    for f in fa.get('face_analysis', {}).get('face_analyses', [])[:2]:
+        face_bits.append(f"eye={f.get('eye_status')} ear={f.get('ear_avg')} pitch={f.get('head_pitch_deg')} yaw={f.get('head_yaw_deg')} gaze={f.get('gaze_direction')} yawn={f.get('yawn_status')}")
+    tracks = fa.get('active_track_ids', [])
+    return f"t={fa['timestamp']}s persons={fa['person_count']} tracks={tracks} dets=[{'; '.join(dets) or 'none'}] faces=[{'; '.join(face_bits) or 'none'}]"
+
+def _event_context_items(candidate, frame_analyses):
+    dense = candidate.metadata.get('dense_frames') or []
+    if dense:
+        if len(dense) > VLM_CONTEXT_IMAGES:
+            step = max(1, math.ceil(len(dense) / VLM_CONTEXT_IMAGES))
+            dense = dense[::step][:VLM_CONTEXT_IMAGES]
+        return [{'kind': 'dense', 'frame': f, 'summary': f"dense t={f['timestamp']}s"} for f in dense]
+    total = len(frame_analyses)
+    ev = candidate.evidence_frame if candidate.evidence_frame is not None else candidate.frame_indices[0]
+    choices = [max(0, candidate.frame_indices[0] - 1), ev, min(total - 1, candidate.frame_indices[-1] + 1)]
+    clean = None
+    for i, fa in enumerate(frame_analyses):
+        if i in candidate.frame_indices:
+            continue
+        if candidate.behavior == 'mobile' and not fa['phone_detected']:
+            clean = i
+            break
+        if candidate.behavior == 'writing' and not fa['book_detected']:
+            clean = i
+            break
+        if candidate.behavior == 'packing' and not fa['bag_detected']:
+            clean = i
+            break
+        if candidate.behavior == 'leaving' and fa['person_count'] >= 1:
+            clean = i
+            break
+    if clean is not None:
+        choices.append(clean)
+    out = []
+    for i in choices:
+        if i not in out and 0 <= i < total:
+            out.append(i)
+    return [{'kind': 'analysis', 'idx': i, 'summary': _frame_cv_summary(frame_analyses[i])} for i in out[:VLM_CONTEXT_IMAGES]]
+
+def _pil_for_vlm_item(item, candidate, frame_analyses):
+    if item['kind'] == 'dense':
+        img = _read_frame(item['frame'])
+    else:
+        fa = frame_analyses[item['idx']]
+        img = _read_frame(fa.get('frame_item') or fa.get('frame_path'))
+        if img is None:
+            img = cv2.imread(ensure_annotated_frame(frame_analyses, item['idx']))
+    if candidate.behavior in ('mobile', 'writing', 'packing') and item['kind'] == 'analysis':
+        fa = frame_analyses[item['idx']]
+        names = {'mobile': {'cell_phone'}, 'writing': {'book', 'laptop'}, 'packing': {'backpack', 'handbag', 'suitcase'}}[candidate.behavior]
+        boxes = [d['bbox'] for d in fa.get('yolo_detections', []) if d['class_name'] in names]
+        if boxes:
+            H, W = img.shape[:2]
+            x1 = max(0, min(b[0] for b in boxes) - int(0.15 * W))
+            y1 = max(0, min(b[1] for b in boxes) - int(0.15 * H))
+            x2 = min(W, max(b[2] for b in boxes) + int(0.15 * W))
+            y2 = min(H, max(b[3] for b in boxes) + int(0.15 * H))
+            crop = img[y1:y2, x1:x2]
+            if crop.size:
+                img = crop
+    rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    return Image.fromarray(rgb).resize((VLM_IMAGE_SIZE, VLM_IMAGE_SIZE))
+
+def build_event_prompt(candidate, frame_analyses, items):
+    cv_lines = '\n'.join([f"Image {n + 1}: {it['summary']}" for n, it in enumerate(items)])
+    near = frame_analyses[max(0, candidate.frame_indices[0] - 3):candidate.frame_indices[-1] + 4]
+    person_timeline = ', '.join([f"{fa['timestamp']}s:{fa['person_count']}p" for fa in near])
+    rule = VLM_TASK_RULES.get(candidate.behavior, 'Decide if the behavior is present.')
+    return f"""You are validating one safety event candidate from locomotive cab CCTV.
+Behavior: {candidate.behavior}
+Candidate interval: {candidate.start_ts}-{candidate.end_ts}s
+Local CV score: {candidate.local_score}
+Local reason: {candidate.reason}
+Candidate metadata: {json.dumps({k: v for k, v in candidate.metadata.items() if k not in ('dense_frames', 'evidence_frame_item')}, default=str)}
+Person-count timeline near event: {person_timeline}
+
+CV evidence per image:
+{cv_lines}
+
+Task rule: {rule}
+
+Important railway context:
+- Looking at or operating the control panel, gauges, switches, brake, horn, or normal instruments is normal_control_check, not distraction.
+- Writing/paperwork is a separate behavior, not generic distraction.
+- Reduced alertness includes yawning, drowsy posture, prolonged disengagement, or microsleep signs.
+
+Return ONLY valid JSON:
+{{"decision":"yes|no|uncertain", "confidence_0_1":0.0, "attention_state":"alert|reduced_alertness|yawning|drowsy|normal_control_check|writing|non_operational_distraction|uncertain", "subtype":"writing|distracted|yawn|blink|microsleep|sleep|none", "evidence_image":1, "reason":"short reason grounded in the image sequence"}}
+"""
+
+def _evidence_info_from_item(item, candidate):
+    if item.get('kind') == 'dense':
+        frame = item['frame']
+        return {
+            'source': 'dense_event_frame',
+            'timestamp': frame.get('timestamp'),
+            'frame_item': frame,
+            'analysis_idx': None,
+        }
+    return {
+        'source': 'sampled_analysis_frame',
+        'timestamp': None,
+        'frame_item': None,
+        'analysis_idx': item.get('idx', candidate.evidence_frame),
+    }
+
+def run_vlm_on_event(candidate, frame_analyses):
+    load_vlm_model()
+    items = _event_context_items(candidate, frame_analyses)
+    images = [_pil_for_vlm_item(item, candidate, frame_analyses) for item in items]
+    prompt = build_event_prompt(candidate, frame_analyses, items)
+    messages = [{'role': 'user', 'content': [{'type': 'image', 'image': im} for im in images] + [{'type': 'text', 'text': prompt}]}]
+    PROFILER.start('vlm_preprocess', sync_cuda=True)
+    text = vlm_processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    img_inputs, vid_inputs = process_vision_info(messages)
+    inputs = vlm_processor(text=[text], images=img_inputs, videos=vid_inputs, padding=True, return_tensors='pt').to(vlm_model.device)
+    input_tokens = int(inputs.input_ids.shape[1])
+    PROFILER.stop({'behavior': candidate.behavior, 'images': len(images), 'input_tokens': input_tokens, 'dense': bool(candidate.metadata.get('dense_frames'))})
+    PROFILER.start('vlm_generate', sync_cuda=True)
+    with torch.inference_mode():
+        out_ids = vlm_model.generate(**inputs, max_new_tokens=VLM_MAX_TOKENS, do_sample=False)
+    gen = out_ids[:, inputs.input_ids.shape[1]:]
+    raw = vlm_processor.batch_decode(gen, skip_special_tokens=True)[0].strip()
+    PROFILER.stop({'behavior': candidate.behavior, 'output_tokens': int(gen.shape[1])})
+    parsed = _safe_json(raw)
+    ev_img = parsed.get('evidence_image') or parsed.get('evidence_frame') or 1
+    try:
+        ev_item = items[max(0, min(len(items) - 1, int(ev_img) - 1))]
+    except Exception:
+        ev_item = items[0] if items else {'kind': 'analysis', 'idx': candidate.evidence_frame}
+    evidence_info = _evidence_info_from_item(ev_item, candidate)
+    ev_idx = evidence_info.get('analysis_idx')
+    return parsed, raw, ev_idx, evidence_info
+
+def _status_to_bool(key, status):
+    if key == 'alertness':
+        return status in ('LOW', 'MODERATE')
+    if key == 'distraction':
+        return status in ('LOW', 'MODERATE', 'HIGH', 'OBSERVED')
+    return status == 'OBSERVED'
+
+def _attention_state(parsed):
+    state = str(parsed.get('attention_state') or parsed.get('subtype') or '').lower()
+    if state == 'yawn':
+        state = 'yawning'
+    if state == 'distracted':
+        state = 'non_operational_distraction'
+    return state if state in ATTENTION_STATES else 'uncertain'
+
+def _clean_reason(text):
+    if not text:
+        return ''
+    return re.sub(r'\s*\|\s*VLM error:.*$', '', str(text)).strip()
+
+def _fmt_seconds(seconds):
+    if seconds is None:
+        return 'N/A'
+    seconds = int(round(float(seconds)))
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    return f'{h:02d}:{m:02d}:{s:02d}'
+
+def _behavior_description(key, status, candidate, param):
+    reason = _clean_reason(candidate.reason if candidate else param.get('local_signal_summary') or '')
+    runtime_note = param.get('vlm_runtime_note')
+    if key == 'mobile':
+        if status == 'OBSERVED':
+            text = 'Observed. Active mobile phone use was confirmed over the event sequence.'
+        elif param.get('phone_visible_frames'):
+            text = 'Not Observed. A phone-like object was visible, but active holding/use was not confirmed.'
+        else:
+            text = 'Not Observed. No phone-like object or active use was confirmed.'
+    elif key == 'writing':
+        if status == 'OBSERVED':
+            text = 'Observed. Sustained paperwork-focused activity consistent with writing was detected.'
+        elif param.get('writing_signal_frames') or param.get('document_visible_frames'):
+            text = 'Not Observed. Paper/document-like material was visible, but active writing was not confirmed.'
+        else:
+            text = 'Not Observed. No sustained paperwork activity was confirmed.'
+    elif key == 'leaving':
+        run_len = param.get('zero_person_run_frames') or candidate.metadata.get('zero_person_run_frames', 0) if candidate else param.get('zero_person_run_frames', 0)
+        if status == 'OBSERVED':
+            text = f'Observed. Person count remained 0 for {run_len} consecutive sampled frames, consistent with crew leaving position.'
+        else:
+            text = 'Not Observed. The cabin did not remain empty for enough consecutive sampled frames to confirm leaving position.'
+    elif key in ('horn', 'brake_a9'):
+        run_len = param.get('temporal_run_frames') or (candidate.metadata.get('temporal_run_frames', 0) if candidate else 0)
+        stable = param.get('spatially_stable')
+        label = 'Horn lever activity' if key == 'horn' else 'A9/SA9 brake activity'
+        if status == 'OBSERVED':
+            text = f'Observed. {label} was detected across {run_len} temporally consistent sampled frames.'
+        else:
+            reason_suffix = 'detected boxes were not spatially stable enough to confirm visibility.' if stable is False else 'temporal support was insufficient to confirm the action.'
+            text = f'Not Observed. Brief {label.lower()} detections may have appeared, but {reason_suffix}'
+    else:
+        lead = {
+            'OBSERVED': 'Observed.',
+            'NOT_OBSERVED': 'Not Observed.',
+            'HIGH': 'High.',
+            'MODERATE': 'Moderate.',
+            'LOW': 'Low.',
+            'NONE': 'None.',
+        }.get(status, f'{status}.')
+        text = f'{lead} {reason}'.strip() if reason else lead
+    if runtime_note:
+        text = f'{text} {runtime_note}'.strip()
+    return text
+
+def fuse_event_score(candidate, vlm_result=None):
+    local = candidate.local_score
+    vlm_score = 0.0
+    vlm_decision = 'none'
+    vlm_conf = 0.0
+    subtype = None
+    state = None
+    if vlm_result:
+        vlm_decision = str(vlm_result.get('decision', 'uncertain')).lower()
+        subtype = str(vlm_result.get('subtype') or '').lower() or None
+        state = _attention_state(vlm_result)
+        vlm_conf = float(vlm_result.get('confidence_0_1') or 0.0)
+        if vlm_decision == 'yes':
+            vlm_score = vlm_conf
+        elif vlm_decision == 'no':
+            vlm_score = -vlm_conf
+    candidate.vlm_score = round(vlm_score, 3)
+    candidate.metadata['vlm_decision'] = vlm_decision
+    candidate.metadata['vlm_confidence'] = round(vlm_conf, 3)
+    if subtype:
+        candidate.metadata['vlm_subtype'] = subtype
+    if state:
+        candidate.metadata['attention_state'] = state
+
+    if candidate.behavior == 'attention_state':
+        if state in ('reduced_alertness', 'yawning', 'drowsy'):
+            final = max(0.58, local * 0.35 + vlm_conf * 0.65)
+            candidate.decision = 'LOW' if state == 'drowsy' and vlm_conf >= 0.75 else 'MODERATE'
+        elif state == 'non_operational_distraction':
+            final = max(0.62, local * 0.35 + vlm_conf * 0.65)
+            candidate.decision = 'HIGH' if vlm_conf >= 0.82 and (candidate.end_ts - candidate.start_ts) >= 4 else 'MODERATE'
+        elif state == 'writing':
+            final = max(0.62, local * 0.30 + vlm_conf * 0.70)
+            candidate.decision = 'WRITING'
+        elif state in ('normal_control_check', 'alert'):
+            final = min(0.35, local * 0.25)
+            candidate.decision = 'NORMAL_OPERATION'
+        else:
+            final = local * 0.35 + max(0, vlm_score) * 0.25
+            candidate.decision = 'UNCERTAIN'
+        candidate.final_score = round(max(0.0, min(1.0, final)), 3)
+        return candidate
+
+    if candidate.behavior in ('horn', 'brake_a9'):
+        run_len = int(candidate.metadata.get('temporal_run_frames') or len(candidate.frame_indices))
+        conf_gate = float(candidate.metadata.get('max_yolo_conf') or 0.0)
+        stable = bool(candidate.metadata.get('spatially_stable'))
+        median_iou = float(candidate.metadata.get('median_iou') or 0.0)
+        final = local * 0.70 + max(0, vlm_score) * 0.30
+        if candidate.behavior == 'brake_a9':
+            if stable and run_len >= 3 and conf_gate >= 0.80 and median_iou >= 0.22:
+                final = max(final, 0.74)
+            else:
+                final = min(final, 0.42)
+        else:
+            if stable and run_len >= 2 and conf_gate >= 0.72:
+                final = max(final, 0.68)
+            elif run_len < 2 or conf_gate < 0.55 or not stable:
+                final = min(final, 0.44)
+    elif candidate.behavior == 'nap':
+        if subtype in ('yawn', 'yawning'):
+            candidate.metadata['alertness_from_yawn'] = True
+            final = min(0.55, local * 0.40 + max(0, vlm_score) * 0.20)
+        elif vlm_score >= 0.80 and local >= 0.35:
+            final = max(0.72, local * 0.55 + vlm_score * 0.45)
+        else:
+            final = local * 0.65 + max(0, vlm_score) * 0.35
+    elif candidate.behavior == 'distraction':
+        if state == 'normal_control_check':
+            final = 0.15
+        elif state == 'non_operational_distraction':
+            final = max(0.62, local * 0.35 + max(0, vlm_score) * 0.65)
+        else:
+            final = min(0.55, local * 0.40 + max(0, vlm_score) * 0.30)
+        if candidate.metadata.get('head_yaw_only') and state != 'non_operational_distraction':
+            final = min(final, 0.45)
+    elif candidate.behavior == 'writing':
+        sustained = bool(candidate.metadata.get('dense_frames')) or len(candidate.frame_indices) >= 2
+        gaze_overlap = float(candidate.metadata.get('gaze_overlap') or 0.0)
+        paper_score = float(candidate.metadata.get('paper_score') or 0.0)
+        final = local * 0.35 + max(0, vlm_score) * 0.65
+        if sustained and vlm_decision == 'yes':
+            final = max(final, 0.72)
+        elif sustained and gaze_overlap >= 0.60 and paper_score >= 0.55 and vlm_decision not in ('no',):
+            final = max(final, 0.62)
+        if vlm_score < -0.70:
+            final *= 0.30
+    elif candidate.behavior == 'alertness':
+        final = local * 0.45 + max(0, vlm_score) * 0.55
+        if subtype in ('yawn', 'yawning') and vlm_score >= 0.55:
+            final = max(final, 0.55)
+    elif candidate.behavior == 'leaving':
+        zero_run = int(candidate.metadata.get('zero_person_run_frames') or len(candidate.frame_indices))
+        final = local * 0.70 + max(0, vlm_score) * 0.30
+        if zero_run >= 4:
+            final = max(final, 0.72)
+        if vlm_score < -0.65 and local < 0.80:
+            final *= 0.50
+    elif candidate.behavior == 'mobile':
+        sustained = bool(candidate.metadata.get('dense_frames')) or len(candidate.frame_indices) >= 2
+        final = local * 0.35 + max(0, vlm_score) * 0.65
+        if vlm_decision == 'yes' and sustained:
+            final = max(final, 0.72)
+        elif vlm_decision == 'no':
+            final = min(final, 0.42)
+        elif not sustained:
+            final = min(final, 0.48)
+    else:
+        final = local * 0.45 + max(0, vlm_score) * 0.55
+        if vlm_score < -0.55:
+            final *= 0.45
+    candidate.final_score = round(max(0.0, min(1.0, final)), 3)
+    threshold = FUSION_THRESHOLDS.get(candidate.behavior, 0.65)
+    candidate.decision = 'OBSERVED' if candidate.final_score >= threshold else 'NOT_OBSERVED'
+    if candidate.behavior == 'distraction' and candidate.decision == 'OBSERVED':
+        candidate.decision = 'HIGH' if candidate.final_score >= 0.8 and state == 'non_operational_distraction' else 'MODERATE'
+    if candidate.behavior == 'alertness' and candidate.final_score >= 0.48:
+        candidate.decision = 'MODERATE' if candidate.final_score < 0.75 else 'LOW'
+    return candidate
+
+def _save_candidate_evidence(candidate, frame_analyses, key):
+    src_item = candidate.metadata.get('evidence_frame_item')
+    if src_item and src_item.get('image') is not None:
+        filename = f"{key}_{int(time.time() * 1000)}.jpg"
+        p = f"{DETECTION_DIR}/{filename}"
+        cv2.imwrite(p, src_item['image'])
+        return f"/detections/{filename}"
+    idx = candidate.evidence_frame
+    if idx is not None and 0 <= idx < len(frame_analyses):
+        ann = ensure_annotated_frame(frame_analyses, idx)
+        return save_evidence_image(ann, key)
+    return None
+
+def _apply_attention_state(parameters, attention_candidates):
+    if not attention_candidates:
+        return None, None
+    valid = [c for c in attention_candidates if c.metadata.get('attention_state')]
+    if not valid:
+        return None, None
+    priority = {
+        'drowsy': 0, 'reduced_alertness': 1, 'yawning': 2,
+        'non_operational_distraction': 3, 'writing': 4,
+        'normal_control_check': 5, 'alert': 6, 'uncertain': 7,
+    }
+    best = sorted(valid, key=lambda c: (priority.get(c.metadata.get('attention_state'), 9), -c.final_score))[0]
+    state = best.metadata.get('attention_state')
+    if state in ('drowsy', 'reduced_alertness', 'yawning'):
+        parameters['alertness']['status'] = 'LOW' if state == 'drowsy' and best.final_score >= 0.75 else 'MODERATE'
+        parameters['alertness']['confidence'] = 'HIGH' if best.final_score >= 0.80 else 'MEDIUM'
+        parameters['alertness']['description'] = f"{parameters['alertness']['status']}. Attention-state VLM classified {state}."
+        parameters['alertness']['evidence_frame_idx'] = best.evidence_frame
+        parameters['alertness']['_evidence_candidate'] = best
+    elif state == 'non_operational_distraction':
+        parameters['distraction']['status'] = 'HIGH' if best.final_score >= 0.80 and (best.end_ts - best.start_ts) >= 4 else 'MODERATE'
+        parameters['distraction']['confidence'] = 'HIGH' if best.final_score >= 0.80 else 'MEDIUM'
+        parameters['distraction']['description'] = 'Observed. Attention-state VLM classified non-operational distraction.'
+        parameters['distraction']['evidence_frame_idx'] = best.evidence_frame
+        parameters['distraction']['_evidence_candidate'] = best
+    elif state == 'writing':
+        if 'writing' in parameters:
+            parameters['writing']['status'] = 'OBSERVED'
+            parameters['writing']['confidence'] = 'HIGH' if best.final_score >= 0.80 else 'MEDIUM'
+            parameters['writing']['description'] = 'Observed. Attention-state VLM classified writing/paperwork.'
+            parameters['writing']['evidence_frame_idx'] = best.evidence_frame
+            parameters['writing']['_evidence_candidate'] = best
+        if parameters.get('distraction', {}).get('status') == 'HIGH':
+            parameters['distraction']['status'] = 'LOW'
+            parameters['distraction']['description'] = 'Low. Attention was associated with paperwork rather than generic non-operational distraction.'
+    elif state in ('normal_control_check', 'alert'):
+        if parameters.get('distraction', {}).get('status') in ('HIGH', 'MODERATE'):
+            parameters['distraction']['status'] = 'NONE' if state == 'alert' else 'LOW'
+            parameters['distraction']['confidence'] = 'HIGH' if best.metadata.get('vlm_confidence', 0) >= 0.75 else 'MEDIUM'
+            parameters['distraction']['description'] = f"{parameters['distraction']['status']}. VLM classified the posture as {state}, not non-operational distraction."
+            parameters['distraction']['evidence_frame_idx'] = None
+    return best, state
+
+def apply_event_fusion(parameters, event_candidates, frame_analyses):
+    by_behavior = defaultdict(list)
+    for c in event_candidates:
+        by_behavior[c.behavior].append(c)
+
+    _apply_attention_state(parameters, by_behavior.get('attention_state', []))
+
+    for behavior, cands in by_behavior.items():
+        if behavior == 'attention_state':
+            continue
+        pk = BEHAVIOR_TO_PARAM.get(behavior)
+        if not pk or pk not in parameters:
+            continue
+        best = max(cands, key=lambda c: c.final_score)
+        prior_status = parameters[pk].get('status')
+        if behavior == 'alertness':
+            if best.final_score >= 0.75:
+                parameters[pk]['status'] = 'LOW'
+            elif best.final_score >= 0.48 and parameters[pk]['status'] == 'HIGH':
+                parameters[pk]['status'] = 'MODERATE'
+        elif behavior == 'distraction':
+            state = best.metadata.get('attention_state')
+            if best.metadata.get('head_yaw_only') and state != 'non_operational_distraction':
+                if parameters[pk]['status'] in ('HIGH', 'MODERATE'):
+                    parameters[pk]['status'] = 'LOW'
+                else:
+                    parameters[pk]['status'] = 'NONE'
+            else:
+                parameters[pk]['status'] = best.decision if best.decision in ('HIGH', 'MODERATE') else ('NONE' if not _status_to_bool(pk, parameters[pk]['status']) else parameters[pk]['status'])
+        elif behavior == 'writing' and prior_status == 'OBSERVED' and best.decision == 'NOT_OBSERVED':
+            strong_no = best.metadata.get('vlm_decision') == 'no' and best.metadata.get('vlm_confidence', 0) >= 0.80 and not best.metadata.get('dense_frames')
+            if strong_no:
+                parameters[pk]['status'] = 'NOT_OBSERVED'
+            else:
+                parameters[pk]['status'] = 'OBSERVED'
+                best.decision = 'OBSERVED'
+                best.final_score = max(best.final_score, 0.50)
+        else:
+            parameters[pk]['status'] = best.decision
+        parameters[pk]['confidence'] = 'HIGH' if best.final_score >= 0.80 else 'MEDIUM' if best.final_score >= 0.55 else 'LOW'
+        parameters[pk]['evidence_type'] = 'vlm_sequence' if best.metadata.get('dense_frames') else ('roi_motion' if best.metadata.get('paper_score') else 'fusion')
+        parameters[pk]['event_duration_s'] = max(0, best.end_ts - best.start_ts)
+        parameters[pk]['vlm_decision'] = best.metadata.get('vlm_decision', 'not_run')
+        parameters[pk]['vlm_subtype'] = best.metadata.get('vlm_subtype') or best.metadata.get('attention_state')
+        parameters[pk]['local_signal_summary'] = _clean_reason(best.reason)
+        parameters[pk]['evidence_timestamp_s'] = best.metadata.get('evidence_timestamp_s')
+        parameters[pk]['evidence_source'] = best.metadata.get('evidence_source')
+        parameters[pk]['phone_visible_frames'] = best.metadata.get('phone_visible_frames', parameters[pk].get('phone_visible_frames'))
+        parameters[pk]['writing_signal_frames'] = best.metadata.get('writing_signal_frames', parameters[pk].get('writing_signal_frames'))
+        parameters[pk]['document_visible_frames'] = best.metadata.get('document_visible_frames', parameters[pk].get('document_visible_frames'))
+        parameters[pk]['zero_person_run_frames'] = best.metadata.get('zero_person_run_frames', parameters[pk].get('zero_person_run_frames'))
+        parameters[pk]['temporal_run_frames'] = best.metadata.get('temporal_run_frames', parameters[pk].get('temporal_run_frames'))
+        parameters[pk]['spatially_stable'] = best.metadata.get('spatially_stable', parameters[pk].get('spatially_stable'))
+        parameters[pk]['detector_max_confidence'] = best.metadata.get('max_yolo_conf', parameters[pk].get('detector_max_confidence'))
+        parameters[pk]['description'] = _behavior_description(pk, parameters[pk]['status'], best, parameters[pk])
+        if best.evidence_frame is not None and _status_to_bool(pk, parameters[pk]['status']):
+            parameters[pk]['evidence_frame_idx'] = best.evidence_frame
+            parameters[pk]['_evidence_candidate'] = best
+
+    face_frames = sum(1 for fa in frame_analyses if fa.get('face_analysis', {}).get('faces_detected', 0) > 0)
+    face_rate = face_frames / max(1, len(frame_analyses))
+    if face_rate < 0.08 and parameters.get('alertness', {}).get('status') == 'HIGH':
+        parameters['alertness']['confidence'] = 'MEDIUM'
+        parameters['alertness']['description'] = 'High. No reduced-alertness event was confirmed, but face visibility was sparse.'
+        parameters['alertness']['local_signal_summary'] = f'sparse face detection rate={face_rate:.1%}'
+
+    yawn_alert = [c for c in event_candidates if c.metadata.get('alertness_from_yawn') and c.vlm_score > 0.5]
+    if yawn_alert and parameters.get('alertness', {}).get('status') == 'HIGH':
+        best_yawn = max(yawn_alert, key=lambda c: c.vlm_score)
+        parameters['alertness']['status'] = 'MODERATE'
+        parameters['alertness']['confidence'] = 'MEDIUM'
+        parameters['alertness']['description'] = 'Moderate. Yawning or mouth-open alertness evidence was detected in the event sequence.'
+        parameters['alertness']['evidence_frame_idx'] = best_yawn.evidence_frame
+        parameters['alertness']['_evidence_candidate'] = best_yawn
+        parameters['alertness']['evidence_type'] = 'vlm_sequence'
+        parameters['alertness']['event_duration_s'] = max(0, best_yawn.end_ts - best_yawn.start_ts)
+        parameters['alertness']['vlm_decision'] = best_yawn.metadata.get('vlm_decision', 'yes')
+        parameters['alertness']['vlm_subtype'] = best_yawn.metadata.get('vlm_subtype')
+        parameters['alertness']['local_signal_summary'] = _clean_reason(best_yawn.reason)
+
+    for key, param in parameters.items():
+        cand = param.pop('_evidence_candidate', None)
+        st = param.get('status', '')
+        if st in ('NOT_OBSERVED', 'NONE') or (key == 'alertness' and st == 'HIGH'):
+            param['evidence_frame_idx'] = None
+            continue
+        if cand is not None:
+            param['image_url'] = _save_candidate_evidence(cand, frame_analyses, key)
+            param['evidence_timestamp_s'] = cand.metadata.get('evidence_timestamp_s', param.get('evidence_timestamp_s'))
+            param['evidence_source'] = cand.metadata.get('evidence_source', param.get('evidence_source'))
+        else:
+            idx = param.get('evidence_frame_idx')
+            if idx is not None and 0 <= idx < len(frame_analyses):
+                ann = ensure_annotated_frame(frame_analyses, idx)
+                param['image_url'] = save_evidence_image(ann, key)
+                param['evidence_timestamp_s'] = frame_analyses[idx].get('timestamp')
+                param['evidence_source'] = 'sampled_analysis_frame'
+        if param.get('evidence_timestamp_s') is not None:
+            param['timestamp'] = _fmt_seconds(param['evidence_timestamp_s'])
+    return parameters
+
+def build_final_summary(parameters):
+    issues = []
+    if parameters.get('alertness', {}).get('status') == 'LOW':
+        issues.append('low alertness')
+    if parameters.get('alertness', {}).get('status') == 'MODERATE':
+        issues.append('moderate alertness/yawning')
+    if parameters.get('nap', {}).get('status') == 'OBSERVED':
+        issues.append('napping/micro-sleep')
+    if parameters.get('mobile', {}).get('status') == 'OBSERVED':
+        issues.append('mobile phone use')
+    if parameters.get('distraction', {}).get('status') in ('HIGH', 'MODERATE', 'OBSERVED'):
+        issues.append('distraction')
+    if parameters.get('leaving', {}).get('status') == 'OBSERVED':
+        issues.append('crew left position')
+    if parameters.get('writing', {}).get('status') == 'OBSERVED':
+        issues.append('writing during duty')
+    if parameters.get('packing', {}).get('status') == 'OBSERVED':
+        issues.append('packing belongings')
+    if parameters.get('horn', {}).get('status') == 'OBSERVED':
+        issues.append('horn operation')
+    if parameters.get('brake_a9', {}).get('status') == 'OBSERVED':
+        issues.append('A9/SA9 brake')
+    summary = f"Flagged {len(issues)} concern(s): {', '.join(issues)}. Review recommended." if issues else 'Safe crew behaviour. No critical violations.'
+    recs = []
+    alert_ts = parameters.get('alertness', {}).get('timestamp')
+    if parameters.get('alertness', {}).get('status') != 'HIGH':
+        recs.append(f"- Review alertness evidence around {alert_ts}.")
+    if parameters.get('mobile', {}).get('status') == 'OBSERVED':
+        recs.append(f"- Review the mobile-use interval around {parameters['mobile'].get('timestamp')}.")
+    if parameters.get('leaving', {}).get('status') == 'OBSERVED':
+        recs.append(f"- Review the empty-cabin interval around {parameters['leaving'].get('timestamp')}.")
+    if parameters.get('writing', {}).get('status') == 'OBSERVED':
+        recs.append(f"- Verify whether paperwork activity around {parameters['writing'].get('timestamp')} was operationally required.")
+    if parameters.get('horn', {}).get('status') == 'OBSERVED':
+        recs.append(f"- Verify horn operation around {parameters['horn'].get('timestamp')}.")
+    if parameters.get('brake_a9', {}).get('status') == 'OBSERVED':
+        recs.append(f"- Confirm A9/SA9 brake procedure around {parameters['brake_a9'].get('timestamp')}.")
+    if not recs:
+        recs.append('- Behaviour compliant. Continue monitoring.')
+    return summary, '\n'.join(recs)
+
+def analyze_with_qwen_vl(parameters, frame_analyses, event_candidates_or_map):
+    event_candidates = build_event_candidates(frame_analyses, parameters) if isinstance(event_candidates_or_map, dict) else event_candidates_or_map
+    selected = select_vlm_events(event_candidates) if ENABLE_VLM else []
+    print(f'  Running event-level VLM on {len(selected)} candidates...')
+    raw_outputs = []
+    for n, cand in enumerate(selected, 1):
+        try:
+            parsed, raw, ev_idx, evidence_info = run_vlm_on_event(cand, frame_analyses)
+            cand.evidence_frame = ev_idx if ev_idx is not None else cand.evidence_frame
+            cand.metadata['evidence_source'] = evidence_info.get('source')
+            ev_ts = evidence_info.get('timestamp')
+            if ev_ts is None and ev_idx is not None and 0 <= ev_idx < len(frame_analyses):
+                ev_ts = frame_analyses[ev_idx].get('timestamp')
+            cand.metadata['evidence_timestamp_s'] = ev_ts
+            if evidence_info.get('frame_item') is not None:
+                cand.metadata['evidence_frame_item'] = evidence_info['frame_item']
+            cand.reason = parsed.get('reason') or cand.reason
+            raw_outputs.append({'candidate': cand.to_dict(), 'raw': raw, 'parsed': parsed})
+            fuse_event_score(cand, parsed)
+            print(f"[{n}/{len(selected)}] {cand.behavior} t={cand.start_ts}-{cand.end_ts}s local={cand.local_score:.2f} vlm={cand.vlm_score:.2f} final={cand.final_score:.2f} state={cand.metadata.get('attention_state')} -> {cand.decision}")
+        except Exception as e:
+            cand.metadata['vlm_runtime_note'] = 'VLM verification was unavailable for this event; local evidence was used.'
+            cand.metadata['vlm_error'] = str(e)
+            fuse_event_score(cand, None)
+            print(f'    [{n}/{len(selected)}] {cand.behavior}: VLM error - {e}')
+    for cand in event_candidates:
+        if cand not in selected:
+            fuse_event_score(cand, None)
+    parameters = apply_event_fusion(parameters, event_candidates, frame_analyses)
+    for cand in event_candidates:
+        pk = BEHAVIOR_TO_PARAM.get(cand.behavior)
+        if pk in parameters and cand.metadata.get('vlm_runtime_note') and parameters[pk].get('status') == cand.decision:
+            parameters[pk]['vlm_runtime_note'] = cand.metadata['vlm_runtime_note']
+            parameters[pk]['description'] = _behavior_description(pk, parameters[pk]['status'], cand, parameters[pk])
+    summary, recs = build_final_summary(parameters)
+    return parameters, summary, recs, event_candidates, raw_outputs
+
+print('Event-level VLM and fusion defined.')
+
+# ── CELL 15: PDF report generation ────────────────────────────────────────────
 from fpdf import FPDF
 
-# =========================
-# MEDIAPIPE TASKS API SETUP (v0.10.31+)
-# =========================
-MEDIAPIPE_AVAILABLE = False
-face_landmarker = None
+def strip_emoji(t):
+    return t.encode('latin-1', 'ignore').decode('latin-1') if t else t
 
-# Model file for MediaPipe FaceLandmarker
-FACE_LANDMARKER_MODEL = "face_landmarker.task"
-FACE_LANDMARKER_URL = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task"
+def _fmt_report_seconds(seconds):
+    if seconds is None:
+        return 'N/A'
+    seconds = int(round(float(seconds)))
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    return f'{h:02d}:{m:02d}:{s:02d}'
 
-
-def download_model_if_needed(model_path, url):
-    """Auto-download MediaPipe model file if not present."""
-    if os.path.exists(model_path):
-        return True
-    try:
-        print(f"Downloading {os.path.basename(model_path)} from Google...")
-        urllib.request.urlretrieve(url, model_path)
-        print(f"Downloaded {os.path.basename(model_path)} ({os.path.getsize(model_path) / 1e6:.1f} MB)")
-        return True
-    except Exception as e:
-        print(f"Failed to download model: {e}")
-        return False
-
-
-try:
-    import mediapipe as mp
-    if download_model_if_needed(FACE_LANDMARKER_MODEL, FACE_LANDMARKER_URL):
-        BaseOptions = mp.tasks.BaseOptions
-        FaceLandmarker = mp.tasks.vision.FaceLandmarker
-        FaceLandmarkerOptions = mp.tasks.vision.FaceLandmarkerOptions
-        VisionRunningMode = mp.tasks.vision.RunningMode
-
-        options = FaceLandmarkerOptions(
-            base_options=BaseOptions(model_asset_path=FACE_LANDMARKER_MODEL),
-            running_mode=VisionRunningMode.IMAGE,
-            output_face_blendshapes=True,
-            output_facial_transformation_matrixes=True,
-            num_faces=4,
-            min_face_detection_confidence=0.25,
-            min_face_presence_confidence=0.25,
-            min_tracking_confidence=0.25,
+class CrewReportPDF(FPDF):
+    def __init__(self, video_info):
+        super().__init__()
+        self._vi = video_info
+    def header(self):
+        self.set_font('Helvetica', 'B', 16)
+        self.set_text_color(30, 64, 175)
+        self.cell(0, 10, 'Crew Behavior Monitoring Report', align='C', new_x='LMARGIN', new_y='NEXT')
+        self.set_font('Helvetica', '', 9)
+        self.set_text_color(120, 120, 120)
+        vi = self._vi
+        self.cell(
+            0,
+            5,
+            strip_emoji(
+                f"Generated: {vi.get('analysis_time', 'N/A')}  |  File: {vi.get('filename', 'N/A')}  "
+                f"|  Duration: {vi.get('duration', 0)}s  |  Frames: {vi.get('frames_analyzed', 0)}"
+            ),
+            align='C',
+            new_x='LMARGIN',
+            new_y='NEXT'
         )
-        face_landmarker = FaceLandmarker.create_from_options(options)
-        MEDIAPIPE_AVAILABLE = True
-        print("MediaPipe FaceLandmarker (Tasks API) initialized with blendshapes + 478 landmarks.")
-    else:
-        print("MediaPipe model not available. Face analysis will use OpenCV fallback.")
-except Exception as e:
-    print(f"MediaPipe Tasks API not available: {e}")
-    print("Face analysis will use OpenCV DNN fallback.")
+        self.line(10, self.get_y() + 2, 200, self.get_y() + 2)
+        self.ln(6)
+    def footer(self):
+        self.set_y(-15)
+        self.set_font('Helvetica', 'I', 8)
+        self.set_text_color(150, 150, 150)
+        self.cell(0, 10, f'Qwen2.5-VL + YOLOv8 + MediaPipe  |  Page {self.page_no()}/{{nb}}', align='C')
 
-# Try to import ultralytics YOLO
-try:
-    from ultralytics import YOLO
-    YOLO_AVAILABLE = True
-except ImportError:
-    YOLO_AVAILABLE = False
-    print("Warning: YOLO not available.")
+def generate_pdf_report(parameters, overall_summary, recommendations, video_info):
+    pdf = CrewReportPDF(video_info)
+    pdf.alias_nb_pages()
+    pdf.set_auto_page_break(auto=True, margin=20)
+    pdf.add_page()
+
+    def status_color(key, st):
+        s = st.upper()
+        if s == 'LOW' or (key in ('nap', 'mobile') and s == 'OBSERVED'):
+            return (220, 38, 38)
+        if s in ('NOT_OBSERVED', 'NONE') or (key == 'alertness' and s == 'HIGH'):
+            return (34, 197, 94)
+        if s == 'OBSERVED':
+            return (59, 130, 246)
+        return (245, 158, 11)
+
+    for n, (key, p) in enumerate(parameters.items(), 1):
+        if pdf.get_y() > 220:
+            pdf.add_page()
+        pdf.set_fill_color(24, 30, 50)
+        pdf.set_text_color(255, 255, 255)
+        pdf.set_font('Helvetica', 'B', 11)
+        pdf.cell(0, 8, strip_emoji(f'  #{n}  {p.get("label", key)}'), fill=True, new_x='LMARGIN', new_y='NEXT')
+        st = p.get('status', 'N/A')
+        r, g, b = status_color(key, st)
+        pdf.set_font('Helvetica', 'B', 10)
+        pdf.set_text_color(r, g, b)
+        pdf.cell(22, 7, '  Status: ', new_x='END')
+        pdf.cell(0, 7, st, new_x='LMARGIN', new_y='NEXT')
+
+        if p.get('description'):
+            pdf.set_font('Helvetica', '', 9)
+            pdf.set_text_color(60, 60, 60)
+            pdf.multi_cell(0, 5, strip_emoji(p['description']), new_x='LMARGIN', new_y='NEXT')
+
+        details = [f"Confidence: {p.get('confidence', 'N/A')}"]
+        if p.get('evidence_timestamp_s') is not None:
+            details.append(f"Evidence time: {_fmt_report_seconds(p.get('evidence_timestamp_s'))}")
+        if p.get('event_duration_s'):
+            details.append(f"Event duration: {_fmt_report_seconds(p.get('event_duration_s'))}")
+        if p.get('evidence_source'):
+            details.append(f"Evidence source: {str(p.get('evidence_source')).replace('_', ' ')}")
+        pdf.set_font('Helvetica', 'I', 8)
+        pdf.set_text_color(130, 130, 130)
+        pdf.multi_cell(0, 5, '  |  '.join(details), new_x='LMARGIN', new_y='NEXT')
+
+        img_url = p.get('image_url')
+        if img_url:
+            img_path = str(BASE_DIR / img_url.lstrip("/"))
+            if os.path.exists(img_path):
+                try:
+                    if pdf.get_y() > 210:
+                        pdf.add_page()
+                    pdf.image(img_path, x=15, w=80, h=55)
+                    pdf.ln(2)
+                except Exception:
+                    pass
+        pdf.ln(4)
+        pdf.set_draw_color(200, 200, 200)
+        pdf.line(10, pdf.get_y(), 200, pdf.get_y())
+        pdf.ln(4)
+
+    if overall_summary:
+        if pdf.get_y() > 230:
+            pdf.add_page()
+        pdf.set_fill_color(15, 23, 42)
+        pdf.set_text_color(255, 255, 255)
+        pdf.set_font('Helvetica', 'B', 12)
+        pdf.cell(0, 8, '  Overall Safety Assessment', fill=True, new_x='LMARGIN', new_y='NEXT')
+        pdf.set_font('Helvetica', '', 9)
+        pdf.set_text_color(50, 50, 50)
+        pdf.ln(2)
+        pdf.multi_cell(0, 5, strip_emoji(overall_summary), new_x='LMARGIN', new_y='NEXT')
+        pdf.ln(4)
+
+    if recommendations:
+        if pdf.get_y() > 230:
+            pdf.add_page()
+        pdf.set_fill_color(15, 23, 42)
+        pdf.set_text_color(255, 255, 255)
+        pdf.set_font('Helvetica', 'B', 12)
+        pdf.cell(0, 8, '  Recommendations', fill=True, new_x='LMARGIN', new_y='NEXT')
+        pdf.set_font('Helvetica', '', 9)
+        pdf.set_text_color(50, 50, 50)
+        pdf.ln(2)
+        pdf.multi_cell(0, 5, strip_emoji(recommendations), new_x='LMARGIN', new_y='NEXT')
+
+    pdf_path = f'{DETECTION_DIR}/crew_monitoring_report.pdf'
+    pdf.output(pdf_path)
+    return pdf_path
 
 # =========================
-# CONFIG
+# FastAPI UI wrapper using main_optimized.py template style
 # =========================
-FRAME_DIR = "frames"
-PERSON_DIR = "persons"
-DETECTION_DIR = "detections"
-ANNOTATED_DIR = "annotated"
-
-# Ensure directories exist
-for folder in [FRAME_DIR, PERSON_DIR, DETECTION_DIR, ANNOTATED_DIR]:
-    if os.path.exists(folder) and folder != DETECTION_DIR:
-        shutil.rmtree(folder)
-    os.makedirs(folder, exist_ok=True)
-
-# YOLO COCO classes of interest for railway cab monitoring
-YOLO_CLASSES_OF_INTEREST = {
-    0: "person",
-    67: "cell_phone",
-    24: "backpack",
-    26: "handbag",
-    28: "suitcase",
-    73: "book",
-    63: "laptop",
-    41: "cup",
-    39: "bottle",
-}
-
-# Color map for YOLO annotations (BGR format for OpenCV)
-YOLO_COLORS = {
-    "person": (0, 200, 0),        # Green
-    "cell_phone": (0, 0, 255),    # Red — critical!
-    "book": (255, 100, 0),        # Blue
-    "backpack": (0, 180, 255),    # Orange
-    "handbag": (0, 180, 255),     # Orange
-    "suitcase": (0, 180, 255),    # Orange
-    "laptop": (255, 0, 128),      # Purple
-    "cup": (200, 200, 0),         # Cyan
-    "bottle": (200, 200, 0),      # Cyan
-    "chair": (128, 128, 128),     # Gray
-    "tv": (255, 255, 0),          # Cyan-bright
-    #'lever':(0,0,0), #white
-    #'horn':(0,0,255), #blue
-    #'push':(255,0,0), #red
-}
-
-# =========================
-# FASTAPI SETUP
-# =========================
-app = FastAPI()
-templates = Jinja2Templates(directory="templates")
+app = FastAPI(title="Loco Pilot Crew Behavior Monitoring")
+TEMPLATE_DIR = BASE_DIR / "templates"
+TEMPLATE_INDEX = TEMPLATE_DIR / "index.html"
+templates = Jinja2Templates(directory=str(TEMPLATE_DIR))
 app.mount("/detections", StaticFiles(directory=DETECTION_DIR), name="detections")
 
-# Configure Gemini
-api_key = os.environ.get("GEMINI_API_KEY")
-if not api_key:
-    raise EnvironmentError("GEMINI_API_KEY is not set. Add it to your .env file.")
-genai.configure(api_key=api_key)
-model = genai.GenerativeModel("gemini-2.5-flash")
-
-# Global store for the last analysis (used by PDF download)
 last_report = {
     "parameters": {},
     "overall_summary": "",
     "recommendations": "",
     "video_info": {},
     "result_text": "",
+    "pdf_path": None,
 }
 
-# =========================
-# YOLO SETUP (auto-downloads yolov8s for better accuracy)
-# =========================
-yolo_model = None
-if YOLO_AVAILABLE:
-    try:
-        yolo_model = YOLO("yolov8s.pt")  # Auto-downloads if not present (~22MB)
-        print("YOLO v8s (small) model loaded — better accuracy for small objects.")
-    except Exception:
-        try:
-            yolo_model = YOLO("yolov8n.pt")  # Fallback to nano
-            print("YOLO v8n (nano) model loaded as fallback.")
-        except Exception as e:
-            print(f"Warning: Could not load any YOLO model: {e}")
-            YOLO_AVAILABLE = False
+def _reset_runtime_dirs():
+    for d in [FRAME_DIR, ANNOTATED_DIR, DETECTION_DIR, CROP_DIR, PROFILE_DIR]:
+        shutil.rmtree(d, ignore_errors=True)
+        os.makedirs(d, exist_ok=True)
 
-# =========================
-# CUSTOM BRAKE & HORN YOLO MODEL
-# =========================
-BRAKE_HORN_MODEL_PATH = "brake_horn_detection.pt"
-brake_horn_model = None
-BRAKE_HORN_AVAILABLE = False
-BRAKE_HORN_CLASSES = {
-    0: "horn_active",
-    1: "horn_inactive",
-    2: "brake_applied",
-    3: "brake_released",
-}
-if YOLO_AVAILABLE and os.path.exists(BRAKE_HORN_MODEL_PATH):
-    try:
-        brake_horn_model = YOLO(BRAKE_HORN_MODEL_PATH)
-        BRAKE_HORN_AVAILABLE = True
-        print(f"Custom Brake & Horn YOLO model loaded from {BRAKE_HORN_MODEL_PATH}.")
-    except Exception as e:
-        print(f"Warning: Could not load Brake & Horn model: {e}")
-else:
-    if not os.path.exists(BRAKE_HORN_MODEL_PATH):
-        print(f"Warning: Brake & Horn model not found at {BRAKE_HORN_MODEL_PATH}.")
+def run_local_pipeline(video_path: str, video_filename: str):
+    global PROFILER
+    _reset_runtime_dirs()
+    PROFILER = PipelineProfiler()
+    pipeline_start = time.time()
 
-# =========================
-# OPENCV DNN FACE DETECTOR (fallback when MediaPipe unavailable)
-# =========================
-opencv_face_net = None
-try:
-    # Use OpenCV's built-in DNN face detector (more accurate than Haar cascade)
-    opencv_face_net = cv2.FaceDetectorYN.create(
-        "",  # Will use built-in model
-        "",
-        (320, 320),
-        0.5,  # score threshold
-        0.3,  # nms threshold
-        5000  # top_k
-    )
-    print("OpenCV FaceDetectorYN loaded (DNN-based fallback).")
-except Exception:
-    # Fall back to Haar cascade if DNN not available
-    try:
-        cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
-        opencv_face_cascade = cv2.CascadeClassifier(cascade_path)
-        if opencv_face_cascade.empty():
-            opencv_face_cascade = None
-        else:
-            print("OpenCV Haar face detector loaded (fallback).")
-    except Exception as e:
-        print(f"OpenCV face detector not available: {e}")
-        opencv_face_cascade = None
+    print("=" * 60)
+    print("STEP 1: Frame extraction")
+    frames, fps, duration = extract_frames(video_path)
 
-# =========================
-# FRAME EXTRACTION (denser sampling)
-# =========================
-MAX_FRAMES = 200  # Higher cap since local analysis is fast
-SAMPLE_INTERVAL = 4  # seconds between frames for local analysis
+    print("=" * 60)
+    print("STEP 2: Local CV (batched YOLO + parallel MediaPipe)")
+    PROFILER.start("local_cv_total")
+    frame_analyses = run_full_local_analysis(frames)
+    PROFILER.stop({"frames": len(frame_analyses)})
+    print(f"  Faces detected: {sum(f['face_analysis']['faces_detected'] for f in frame_analyses)}")
+    print(f"  Phone frames : {sum(1 for f in frame_analyses if f['phone_detected'])}")
+    print(f"  Horn frames  : {sum(1 for f in frame_analyses if f['horn_active_detected'])}")
 
+    print("=" * 60)
+    print("STEP 3: Rule-based parameter computation")
+    PROFILER.start("rule_engine")
+    parameters, local_summary, local_recs = compute_parameters_locally(frame_analyses)
+    PROFILER.stop()
+    for k, p in parameters.items():
+        icon = 'ALERT' if p['status'] in ('LOW', 'OBSERVED') else '  ok'
+        print(f"  [{icon}] {p['label']}: {p['status']} (conf={p['confidence']})")
 
-def extract_frames(video_path):
-    """Extract frames every SAMPLE_INTERVAL seconds, capped at MAX_FRAMES.
-    In the last 8 seconds, extracts every second for denser end-of-video analysis."""
-    cap = cv2.VideoCapture(video_path)
-    fps = int(cap.get(cv2.CAP_PROP_FPS))
-    if fps == 0:
-        fps = 30
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    duration = total_frames // fps
+    print("=" * 60)
+    print("STEP 4: Event candidate generation")
+    PROFILER.start("event_candidate_generation")
+    event_candidates = build_event_candidates(frame_analyses, parameters)
+    event_candidates = attach_dense_event_frames(video_path, event_candidates, duration)
+    PROFILER.stop({
+        "events": len(event_candidates),
+        "dense_events": sum(1 for c in event_candidates if c.metadata.get("dense_frames")),
+    })
 
-    # Adaptive interval: if video is long, increase interval to stay within cap
-    interval = SAMPLE_INTERVAL
-    estimated_frames = duration // interval
-    if estimated_frames > MAX_FRAMES:
-        interval = max(1, duration // MAX_FRAMES)
-
-    END_DENSE_SECONDS = 8  # Extract every second for the last 8 seconds
-    dense_start = max(0, duration - END_DENSE_SECONDS)
-
-    frames = []
-    extracted_seconds = set()
-
-    # Regular interval extraction (up to dense_start)
-    for sec in range(0, duration, interval):
-        if sec >= dense_start:
-            break  # Will be handled by dense extraction
-        frame_no = sec * fps
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_no)
-        ret, frame = cap.read()
-        if ret:
-            path = f"{FRAME_DIR}/frame_{sec}.jpg"
-            cv2.imwrite(path, frame)
-            frames.append((sec, path))
-            extracted_seconds.add(sec)
-        if len(frames) >= MAX_FRAMES - END_DENSE_SECONDS:
-            break
-
-    # Dense extraction for last 8 seconds (every 1 second)
-    for sec in range(dense_start, duration):
-        if sec in extracted_seconds:
-            continue
-        frame_no = sec * fps
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_no)
-        ret, frame = cap.read()
-        if ret:
-            path = f"{FRAME_DIR}/frame_{sec}.jpg"
-            cv2.imwrite(path, frame)
-            frames.append((sec, path))
-
-    cap.release()
-    print(f"  Extracted {len(frames)} frames (dense sampling in last {END_DENSE_SECONDS}s: {dense_start}s-{duration}s)")
-    return frames, fps, duration
-
-
-# =========================
-# YOLO FULL OBJECT DETECTION
-# =========================
-def detect_objects_yolo(frame_path):
-    """Run YOLO on a frame. Returns list of all relevant detected objects with class, confidence, bbox."""
-    if not YOLO_AVAILABLE or yolo_model is None:
-        return []
-    try:
-        results = yolo_model(frame_path, verbose=False, conf=0.2)  # Lower threshold to catch small phones
-        detections = []
-        for r in results:
-            for box in r.boxes:
-                cls_id = int(box.cls[0])
-                if cls_id in YOLO_CLASSES_OF_INTEREST:
-                    conf = float(box.conf[0])
-                    x1, y1, x2, y2 = box.xyxy[0].tolist()
-                    detections.append({
-                        "class_id": cls_id,
-                        "class_name": YOLO_CLASSES_OF_INTEREST[cls_id],
-                        "confidence": round(conf, 2),
-                        "bbox": [int(x1), int(y1), int(x2), int(y2)],
-                    })
-        return detections
-    except Exception as e:
-        print(f"YOLO detection error: {e}")
-        return []
-
-
-# =========================
-# BRAKE & HORN DETECTION (Custom YOLO)
-# =========================
-def detect_brake_horn(frame_path):
-    """Run custom Brake & Horn YOLO model on a frame.
-    Returns list of detections with class_name, confidence, bbox."""
-    if not BRAKE_HORN_AVAILABLE or brake_horn_model is None:
-        return []
-    try:
-        results = brake_horn_model(frame_path, verbose=False, conf=0.3)
-        detections = []
-        for r in results:
-            for box in r.boxes:
-                cls_id = int(box.cls[0])
-                if cls_id in BRAKE_HORN_CLASSES:
-                    conf = float(box.conf[0])
-                    x1, y1, x2, y2 = box.xyxy[0].tolist()
-                    detections.append({
-                        "class_id": cls_id,
-                        "class_name": BRAKE_HORN_CLASSES[cls_id],
-                        "confidence": round(conf, 2),
-                        "bbox": [int(x1), int(y1), int(x2), int(y2)],
-                    })
-        return detections
-    except Exception as e:
-        print(f"Brake/Horn detection error: {e}")
-        return []
-
-
-# =========================
-# ADVANCED FACE ANALYSIS
-# (MediaPipe FaceLandmarker + Blendshapes + solvePnP + EAR + MAR)
-# =========================
-
-# Eye landmark indices for 478-point FaceLandmarker model
-LEFT_EYE_IDX = [362, 385, 387, 263, 373, 380]   # p1-p6
-RIGHT_EYE_IDX = [33, 160, 158, 133, 153, 144]   # p1-p6
-
-# Mouth landmark indices for MAR (Mouth Aspect Ratio) — yawn detection
-MOUTH_IDX = [61, 291, 13, 14, 81, 178, 311, 402]  # outer corners + top/bottom
-
-# Key blendshape names we monitor
-BLENDSHAPE_KEYS = [
-    "eyeBlinkLeft", "eyeBlinkRight",
-    "jawOpen",
-    "eyeLookDownLeft", "eyeLookDownRight",
-    "eyeLookUpLeft", "eyeLookUpRight",
-    "eyeLookInLeft", "eyeLookInRight",
-    "eyeLookOutLeft", "eyeLookOutRight",
-    "mouthFunnel", "mouthPucker",
-]
-
-# 3D model points for solvePnP head pose estimation (canonical face)
-# These correspond to: nose tip, chin, left eye outer, right eye outer, left mouth, right mouth
-MODEL_POINTS_3D = np.array([
-    (0.0, 0.0, 0.0),          # Nose tip (landmark 1)
-    (0.0, -330.0, -65.0),     # Chin (landmark 152)
-    (-225.0, 170.0, -135.0),  # Left eye outer (landmark 263)
-    (225.0, 170.0, -135.0),   # Right eye outer (landmark 33)
-    (-150.0, -150.0, -125.0), # Left mouth corner (landmark 61)
-    (150.0, -150.0, -125.0),  # Right mouth corner (landmark 291)
-], dtype=np.float64)
-
-# Landmark indices matching the 3D model points above
-SOLVEPNP_LANDMARK_IDX = [1, 152, 263, 33, 61, 291]
-
-
-def compute_ear(landmarks, eye_indices):
-    """Compute Eye Aspect Ratio from 6 eye landmarks (NormalizedLandmark)."""
-    try:
-        pts = [(landmarks[i].x, landmarks[i].y) for i in eye_indices]
-        # EAR = (|p2-p6| + |p3-p5|) / (2 * |p1-p4|)
-        vertical1 = math.dist(pts[1], pts[5])
-        vertical2 = math.dist(pts[2], pts[4])
-        horizontal = math.dist(pts[0], pts[3])
-        if horizontal < 1e-6:
-            return 0.3
-        return round((vertical1 + vertical2) / (2.0 * horizontal), 3)
-    except Exception:
-        return None
-
-
-def compute_mar(landmarks):
-    """Compute Mouth Aspect Ratio for yawn detection."""
-    try:
-        # Mouth corners (horizontal)
-        left_corner = (landmarks[61].x, landmarks[61].y)
-        right_corner = (landmarks[291].x, landmarks[291].y)
-        # Top and bottom lip (vertical)
-        top_lip = (landmarks[13].x, landmarks[13].y)
-        bottom_lip = (landmarks[14].x, landmarks[14].y)
-        # Additional vertical points
-        top2 = (landmarks[81].x, landmarks[81].y)
-        bottom2 = (landmarks[178].x, landmarks[178].y)
-        top3 = (landmarks[311].x, landmarks[311].y)
-        bottom3 = (landmarks[402].x, landmarks[402].y)
-
-        horizontal = math.dist(left_corner, right_corner)
-        vertical1 = math.dist(top_lip, bottom_lip)
-        vertical2 = math.dist(top2, bottom2)
-        vertical3 = math.dist(top3, bottom3)
-
-        if horizontal < 1e-6:
-            return 0.0
-        mar = (vertical1 + vertical2 + vertical3) / (3.0 * horizontal)
-        return round(mar, 3)
-    except Exception:
-        return None
-
-
-def compute_head_pose_solvepnp(landmarks, img_w, img_h):
-    """Compute precise head pose (pitch, yaw, roll) using cv2.solvePnP."""
-    try:
-        # 2D image points from face landmarks
-        image_points = np.array([
-            (landmarks[idx].x * img_w, landmarks[idx].y * img_h)
-            for idx in SOLVEPNP_LANDMARK_IDX
-        ], dtype=np.float64)
-
-        # Camera matrix approximation
-        focal_length = img_w
-        center = (img_w / 2, img_h / 2)
-        camera_matrix = np.array([
-            [focal_length, 0, center[0]],
-            [0, focal_length, center[1]],
-            [0, 0, 1]
-        ], dtype=np.float64)
-        dist_coeffs = np.zeros((4, 1))
-
-        # Solve PnP
-        success, rotation_vector, translation_vector = cv2.solvePnP(
-            MODEL_POINTS_3D, image_points, camera_matrix, dist_coeffs,
-            flags=cv2.SOLVEPNP_ITERATIVE
+    print("=" * 60)
+    print("STEP 5: Event-level Qwen VLM cross-validation")
+    PROFILER.start("vlm_total", sync_cuda=True)
+    if ENABLE_VLM:
+        parameters, final_summary, final_recs, event_candidates, vlm_raw_outputs = analyze_with_qwen_vl(
+            parameters, frame_analyses, event_candidates
         )
-
-        if not success:
-            return {"pitch": 0.0, "yaw": 0.0, "roll": 0.0, "pitch_label": "unknown", "yaw_label": "unknown"}
-
-        # Convert rotation vector to Euler angles
-        rotation_matrix, _ = cv2.Rodrigues(rotation_vector)
-        angles, _, _, _, _, _ = cv2.RQDecomp3x3(rotation_matrix)
-
-        pitch = round(angles[0], 1)  # Positive = looking up, Negative = looking down
-        yaw = round(angles[1], 1)    # Positive = turned right, Negative = turned left
-        roll = round(angles[2], 1)   # Head tilt
-
-        # Generate human-readable labels
-        if pitch < -15:
-            pitch_label = "drooping"
-        elif pitch < -8:
-            pitch_label = "slight_tilt_down"
-        elif pitch > 15:
-            pitch_label = "looking_up"
-        else:
-            pitch_label = "upright"
-
-        if abs(yaw) > 25:
-            yaw_label = "turned_right" if yaw > 0 else "turned_left"
-        elif abs(yaw) > 12:
-            yaw_label = "slightly_right" if yaw > 0 else "slightly_left"
-        else:
-            yaw_label = "forward"
-
-        return {
-            "pitch": pitch, "yaw": yaw, "roll": roll,
-            "pitch_label": pitch_label, "yaw_label": yaw_label
-        }
-    except Exception:
-        return {"pitch": 0.0, "yaw": 0.0, "roll": 0.0, "pitch_label": "unknown", "yaw_label": "unknown"}
-
-
-def extract_blendshape_scores(blendshapes):
-    """Extract relevant blendshape scores from MediaPipe FaceLandmarker result."""
-    scores = {}
-    if blendshapes:
-        for bs in blendshapes:
-            if bs.category_name in BLENDSHAPE_KEYS:
-                scores[bs.category_name] = round(bs.score, 3)
-    return scores
-
-
-def analyze_face(frame_path):
-    """Advanced face analysis using MediaPipe FaceLandmarker (Tasks API).
-    Returns: EAR, MAR, blendshapes (eyeBlink, jawOpen, gaze), solvePnP head pose."""
-    result = {"faces_detected": 0, "face_analyses": []}
-
-    img = cv2.imread(frame_path)
-    if img is None:
-        return result
-
-    h, w = img.shape[:2]
-
-    # -------- PRIMARY: MediaPipe FaceLandmarker (Tasks API) --------
-    if MEDIAPIPE_AVAILABLE and face_landmarker is not None:
-        try:
-            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            detection_result = face_landmarker.detect(mp_image)
-
-            if detection_result.face_landmarks:
-                result["faces_detected"] = len(detection_result.face_landmarks)
-
-                for face_idx, face_lm in enumerate(detection_result.face_landmarks):
-                    # --- EAR (Eye Aspect Ratio) ---
-                    ear_left = compute_ear(face_lm, LEFT_EYE_IDX)
-                    ear_right = compute_ear(face_lm, RIGHT_EYE_IDX)
-                    avg_ear = None
-                    eye_status = "unknown"
-                    if ear_left is not None and ear_right is not None:
-                        avg_ear = round((ear_left + ear_right) / 2, 3)
-                        if avg_ear < 0.18:
-                            eye_status = "CLOSED"
-                        elif avg_ear < 0.23:
-                            eye_status = "PARTIALLY_CLOSED"
-                        else:
-                            eye_status = "OPEN"
-
-                    # --- MAR (Mouth Aspect Ratio) for yawn detection ---
-                    mar = compute_mar(face_lm)
-                    yawn_status = "NOT_YAWNING"
-                    if mar is not None and mar > 0.6:
-                        yawn_status = "YAWNING"
-                    elif mar is not None and mar > 0.4:
-                        yawn_status = "MOUTH_OPEN"
-
-                    # --- solvePnP Head Pose (precise angles in degrees) ---
-                    head_pose = compute_head_pose_solvepnp(face_lm, w, h)
-
-                    # --- Blendshape scores (direct from MediaPipe model) ---
-                    blendshapes = {}
-                    if detection_result.face_blendshapes and face_idx < len(detection_result.face_blendshapes):
-                        blendshapes = extract_blendshape_scores(
-                            detection_result.face_blendshapes[face_idx]
-                        )
-
-                    # Cross-validate EAR with blendshape eyeBlink
-                    blink_left = blendshapes.get("eyeBlinkLeft", 0)
-                    blink_right = blendshapes.get("eyeBlinkRight", 0)
-                    avg_blink = (blink_left + blink_right) / 2
-
-                    # If blendshapes strongly say eyes closed, override EAR
-                    if avg_blink > 0.6:
-                        eye_status = "CLOSED"
-                    elif avg_blink > 0.4 and eye_status == "OPEN":
-                        eye_status = "PARTIALLY_CLOSED"
-
-                    # Gaze direction from blendshapes
-                    look_down = (blendshapes.get("eyeLookDownLeft", 0) + blendshapes.get("eyeLookDownRight", 0)) / 2
-                    look_up = (blendshapes.get("eyeLookUpLeft", 0) + blendshapes.get("eyeLookUpRight", 0)) / 2
-                    gaze = "down" if look_down > 0.4 else "up" if look_up > 0.4 else "forward"
-
-                    result["face_analyses"].append({
-                        "ear_left": ear_left,
-                        "ear_right": ear_right,
-                        "ear_avg": avg_ear,
-                        "eye_status": eye_status,
-                        "mar": mar,
-                        "yawn_status": yawn_status,
-                        "head_pitch": head_pose["pitch_label"],
-                        "head_yaw": head_pose["yaw_label"],
-                        "head_pitch_deg": head_pose["pitch"],
-                        "head_yaw_deg": head_pose["yaw"],
-                        "head_roll_deg": head_pose["roll"],
-                        "gaze_direction": gaze,
-                        "blink_score": round(avg_blink, 3),
-                        "jaw_open_score": blendshapes.get("jawOpen", 0),
-                        "blendshapes": blendshapes,
-                    })
-                return result
-        except Exception as e:
-            print(f"FaceLandmarker error: {e}")
-
-    # -------- FALLBACK: OpenCV face detection --------
-    try:
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        faces = []
-
-        # Try DNN detector first
-        if opencv_face_net is not None:
-            opencv_face_net.setInputSize((w, h))
-            _, face_dets = opencv_face_net.detect(img)
-            if face_dets is not None:
-                for det in face_dets:
-                    x, y, fw, fh = int(det[0]), int(det[1]), int(det[2]), int(det[3])
-                    faces.append((x, y, fw, fh))
-        elif opencv_face_cascade is not None:
-            face_rects = opencv_face_cascade.detectMultiScale(gray, 1.3, 5)
-            faces = [(x, y, fw, fh) for (x, y, fw, fh) in face_rects]
-
-        result["faces_detected"] = len(faces)
-        for (x, y, fw, fh) in faces:
-            face_center_y = (y + fh / 2) / h
-            pitch_guess = "drooping" if face_center_y > 0.6 else "upright"
-            result["face_analyses"].append({
-                "ear_left": None, "ear_right": None, "ear_avg": None,
-                "eye_status": "unknown (opencv fallback)",
-                "mar": None, "yawn_status": "unknown",
-                "head_pitch": pitch_guess, "head_yaw": "unknown",
-                "head_pitch_deg": None, "head_yaw_deg": None, "head_roll_deg": None,
-                "gaze_direction": "unknown",
-                "blink_score": None, "jaw_open_score": None,
-                "blendshapes": {},
-            })
-    except Exception as e:
-        print(f"OpenCV face detection error: {e}")
-
-    return result
-
-
-# =========================
-# CREATE ANNOTATED FRAME (YOLO boxes drawn on full frame)
-# =========================
-YOLO_COLORS = {
-    "person": (0, 255, 0),
-    "cell_phone": (0, 0, 255),
-    "backpack": (255, 0, 255),
-    "handbag": (255, 0, 255),
-    "suitcase": (255, 0, 255),
-    "book": (0, 165, 255),
-    "laptop": (0, 165, 255),
-    "cup": (128, 128, 0),
-    "bottle": (128, 128, 0),
-    # Custom Brake & Horn classes
-    "horn_active": (255, 0, 0),       # Blue — horn engaged
-    "horn_inactive": (180, 180, 180), # Gray — horn idle
-    "brake_applied": (0, 0, 255),     # Red — brake applied
-    "brake_released": (180, 180, 180),# Gray — brake released
-}
-
-
-def create_annotated_frame(frame_path, yolo_detections, timestamp):
-    """Draw rich YOLO bounding boxes + labels on the full frame. Returns path to annotated image."""
-    img = cv2.imread(frame_path)
-    if img is None:
-        return frame_path
-
-    h, w = img.shape[:2]
-
-    # Critical objects get thicker boxes and highlighted labels
-    CRITICAL_CLASSES = {"cell_phone", "book", "laptop"}
-
-    for det in yolo_detections:
-        conf = det["confidence"]
-        if conf < 0.5:  # Skip low-confidence detections
-            continue
-
-        x1, y1, x2, y2 = det["bbox"]
-        cls_name = det["class_name"]
-        color = YOLO_COLORS.get(cls_name, (255, 255, 255))
-        is_critical = cls_name in CRITICAL_CLASSES
-
-        # Draw bounding box (thicker for critical objects)
-        thickness = 3 if is_critical else 2
-        cv2.rectangle(img, (x1, y1), (x2, y2), color, thickness)
-
-        # Draw corner markers for critical objects
-        if is_critical:
-            corner_len = min(15, (x2 - x1) // 3, (y2 - y1) // 3)
-            # Top-left
-            cv2.line(img, (x1, y1), (x1 + corner_len, y1), color, 4)
-            cv2.line(img, (x1, y1), (x1, y1 + corner_len), color, 4)
-            # Top-right
-            cv2.line(img, (x2, y1), (x2 - corner_len, y1), color, 4)
-            cv2.line(img, (x2, y1), (x2, y1 + corner_len), color, 4)
-            # Bottom-left
-            cv2.line(img, (x1, y2), (x1 + corner_len, y2), color, 4)
-            cv2.line(img, (x1, y2), (x1, y2 - corner_len), color, 4)
-            # Bottom-right
-            cv2.line(img, (x2, y2), (x2 - corner_len, y2), color, 4)
-            cv2.line(img, (x2, y2), (x2, y2 - corner_len), color, 4)
-
-        # Label with background
-        display_name = cls_name.replace("_", " ").upper() if is_critical else cls_name
-        label = f"{display_name} {conf:.0%}"
-        font_scale = 0.55 if is_critical else 0.45
-        font_thick = 2
-        label_size, baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thick)
-
-        # Label background
-        label_y = max(y1, label_size[1] + 10)
-        cv2.rectangle(img, (x1, label_y - label_size[1] - 6), (x1 + label_size[0] + 6, label_y + 2), color, -1)
-        cv2.putText(img, label, (x1 + 3, label_y - 3), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), font_thick)
-
-    # Add timestamp watermark (bottom-left)
-    ts_label = f"T={timestamp}s"
-    cv2.putText(img, ts_label, (5, h - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
-
-    # Add detection summary legend (top-right corner) — only ≥50% confidence
-    high_conf_dets = [d for d in yolo_detections if d["confidence"] >= 0.5]
-    if high_conf_dets:
-        obj_counts = {}
-        for det in high_conf_dets:
-            name = det["class_name"]
-            obj_counts[name] = obj_counts.get(name, 0) + 1
-        
-        legend_y = 15
-        for name, count in obj_counts.items():
-            color = YOLO_COLORS.get(name, (255, 255, 255))
-            legend_text = f"{name}: {count}"
-            text_size, _ = cv2.getTextSize(legend_text, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
-            x_pos = w - text_size[0] - 10
-            # Background
-            cv2.rectangle(img, (x_pos - 3, legend_y - 12), (w - 2, legend_y + 3), (0, 0, 0), -1)
-            cv2.putText(img, legend_text, (x_pos, legend_y), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
-            legend_y += 16
-
-    annotated_path = f"{ANNOTATED_DIR}/annotated_{timestamp}.jpg"
-    cv2.imwrite(annotated_path, img)
-    return annotated_path
-
-
-# =========================
-# COMPREHENSIVE FRAME ANALYSIS PIPELINE
-# (Crops person regions from YOLO boxes for better face detection)
-# =========================
-CROP_DIR = "face_crops"
-os.makedirs(CROP_DIR, exist_ok=True)
-
-
-def analyze_face_on_person_crops(frame_path, yolo_dets, timestamp):
-    """Run face analysis on YOLO person crops (upscaled) for better detection on low-res CCTV.
-    Falls back to full-frame analysis if no person crops yield results."""
-    merged_result = {"faces_detected": 0, "face_analyses": []}
-
-    img = cv2.imread(frame_path)
-    if img is None:
-        return merged_result
-
-    h, w = img.shape[:2]
-
-    # Extract person bounding boxes from YOLO detections
-    person_boxes = [d for d in yolo_dets if d["class_name"] == "person" and d["confidence"] > 0.4]
-
-    if not person_boxes:
-        # No YOLO persons — try full frame as last resort
-        return analyze_face(frame_path)
-
-    for p_idx, person in enumerate(person_boxes):
-        x1, y1, x2, y2 = person["bbox"]
-
-        # Focus on upper 75% of person bbox (head + shoulders + upper body)
-        person_h = y2 - y1
-        head_y2 = y1 + int(person_h * 0.75)
-
-        # Add generous padding around the head region (25% each side)
-        pad_x = int((x2 - x1) * 0.25)
-        pad_y = int((head_y2 - y1) * 0.25)
-        crop_x1 = max(0, x1 - pad_x)
-        crop_y1 = max(0, y1 - pad_y)
-        crop_x2 = min(w, x2 + pad_x)
-        crop_y2 = min(h, head_y2 + pad_y)
-
-        crop = img[crop_y1:crop_y2, crop_x1:crop_x2]
-        if crop.size == 0:
-            continue
-
-        # Upscale small crops aggressively for face landmark detection
-        crop_h, crop_w = crop.shape[:2]
-        min_dim = 400  # Larger crops = better face detection on CCTV
-        if crop_w < min_dim or crop_h < min_dim:
-            scale = max(min_dim / crop_w, min_dim / crop_h)
-            crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-
-        # Save crop temporarily
-        crop_path = f"{CROP_DIR}/crop_{timestamp}_{p_idx}.jpg"
-        cv2.imwrite(crop_path, crop)
-
-        # Run face analysis on the cropped + upscaled person region
-        crop_face_data = analyze_face(crop_path)
-
-        if crop_face_data["faces_detected"] > 0:
-            merged_result["faces_detected"] += crop_face_data["faces_detected"]
-            merged_result["face_analyses"].extend(crop_face_data["face_analyses"])
-
-        # Clean up crop
-        try:
-            os.remove(crop_path)
-        except OSError:
-            pass
-
-    # If person crops didn't yield face detections, try full frame
-    if merged_result["faces_detected"] == 0:
-        return analyze_face(frame_path)
-
-    return merged_result
-
-
-def analyze_all_frames(frames):
-    """Run YOLO object detection + brake/horn detection + face analysis on every frame. Returns structured per-frame data."""
-    frame_analyses = []
-    all_annotated = []
-
-    for timestamp, frame_path in frames:
-        print(f"  Analyzing frame at {timestamp}s...")
-
-        # YOLO object detection (persons, phones, bags, books, etc.)
-        yolo_dets = detect_objects_yolo(frame_path)
-
-        # Custom Brake & Horn YOLO detection
-        brake_horn_dets = detect_brake_horn(frame_path)
-
-        # Face analysis — crop person regions from YOLO for better face detection on CCTV
-        face_data = analyze_face_on_person_crops(frame_path, yolo_dets, timestamp)
-
-        # Merge all detections for annotation drawing
-        all_dets_for_annotation = yolo_dets + brake_horn_dets
-
-        # Create annotated frame with all bounding boxes
-        annotated_path = create_annotated_frame(frame_path, all_dets_for_annotation, timestamp)
-
-        # Summarize object counts
-        obj_counts = {}
-        for det in yolo_dets:
-            name = det["class_name"]
-            obj_counts[name] = obj_counts.get(name, 0) + 1
-
-        # Determine horn/brake states from custom model detections
-        horn_active_detected = any(d["class_name"] == "horn_active" for d in brake_horn_dets)
-        horn_inactive_detected = any(d["class_name"] == "horn_inactive" for d in brake_horn_dets)
-        brake_applied_detected = any(d["class_name"] == "brake_applied" for d in brake_horn_dets)
-        brake_released_detected = any(d["class_name"] == "brake_released" for d in brake_horn_dets)
-
-        frame_info = {
-            "timestamp": timestamp,
-            "frame_path": frame_path,
-            "annotated_path": annotated_path,
-            "yolo_detections": yolo_dets,
-            "brake_horn_detections": brake_horn_dets,
-            "object_counts": obj_counts,
-            "person_count": obj_counts.get("person", 0),
-            "phone_detected": "cell_phone" in obj_counts,
-            "bag_detected": any(k in obj_counts for k in ["backpack", "handbag", "suitcase"]),
-            "book_detected": "book" in obj_counts,
-            "horn_active_detected": horn_active_detected,
-            "horn_inactive_detected": horn_inactive_detected,
-            "brake_applied_detected": brake_applied_detected,
-            "brake_released_detected": brake_released_detected,
-            "face_analysis": face_data,
-        }
-
-        frame_analyses.append(frame_info)
-        all_annotated.append((timestamp, annotated_path))
-
-        # Console log key detections
-        if yolo_dets:
-            det_summary = ", ".join([f"{d['class_name']}({d['confidence']:.0%})" for d in yolo_dets])
-            print(f"    YOLO: {det_summary}")
-        if brake_horn_dets:
-            bh_summary = ", ".join([f"{d['class_name']}({d['confidence']:.0%})" for d in brake_horn_dets])
-            print(f"    Brake/Horn: {bh_summary}")
-        if face_data["faces_detected"] > 0:
-            for i, fa in enumerate(face_data["face_analyses"]):
-                extras = ""
-                if fa.get('head_pitch_deg') is not None:
-                    extras += f", pitch={fa['head_pitch_deg']}deg, yaw={fa['head_yaw_deg']}deg"
-                if fa.get('blink_score') is not None:
-                    extras += f", blink={fa['blink_score']}"
-                if fa.get('yawn_status') and fa['yawn_status'] != 'NOT_YAWNING':
-                    extras += f", {fa['yawn_status']}(MAR={fa.get('mar')})"
-                print(f"    Face {i+1}: eyes={fa['eye_status']}, EAR={fa['ear_avg']}, head={fa['head_pitch']}/{fa['head_yaw']}, gaze={fa.get('gaze_direction','?')}{extras}")
-
-    return frame_analyses, all_annotated
-
-
-# =========================
-# LOCAL RULE-BASED PARAMETER ENGINE
-# =========================
-def find_max_consecutive(indices, total):
-    """Find max number of consecutive indices (e.g., consecutive frames with closed eyes)."""
-    if not indices:
-        return 0
-    max_run = 1
-    current_run = 1
-    for i in range(1, len(indices)):
-        if indices[i] == indices[i-1] + 1:
-            current_run += 1
-            max_run = max(max_run, current_run)
-        else:
-            current_run = 1
-    return max_run
-
-
-def compute_parameters_locally(frame_analyses):
-    """Determine all 7 safety parameters from per-frame CV data using rule-based thresholds.
-    Returns: parameters dict, overall_summary, recommendations (all generated locally)."""
-    total = len(frame_analyses)
-    if total == 0:
-        return {}, "No frames analyzed.", ""
-
-    # --- Pre-compute per-frame metrics ---
-    eyes_closed_indices = []  # Frame indices where any face has eyes closed
-    eyes_partial_indices = []
-    head_drooping_indices = []
-    head_turned_indices = []
-    gaze_down_indices = []
-    yawning_indices = []
-    phone_indices = []
-    bag_indices = []
-    book_indices = []
-    horn_active_indices = []
-    brake_applied_indices = []
-    person_counts = []
-
-    # Collect all yaw values to compute camera baseline
-    all_yaw_values = []
-    all_pitch_values = []
-
-    for i, fa in enumerate(frame_analyses):
-        person_counts.append(fa["person_count"])
-        if fa["phone_detected"]:
-            phone_indices.append(i)
-        if fa["bag_detected"]:
-            bag_indices.append(i)
-        if fa["book_detected"]:
-            book_indices.append(i)
-        if fa.get("horn_active_detected"):
-            horn_active_indices.append(i)
-        if fa.get("brake_applied_detected"):
-            brake_applied_indices.append(i)
-
-        for face in fa["face_analysis"]["face_analyses"]:
-            if face["eye_status"] == "CLOSED":
-                eyes_closed_indices.append(i)
-            elif face["eye_status"] == "PARTIALLY_CLOSED":
-                eyes_partial_indices.append(i)
-
-            pitch_deg = face.get("head_pitch_deg")
-            yaw_deg = face.get("head_yaw_deg")
-
-            if pitch_deg is not None:
-                all_pitch_values.append(pitch_deg)
-            if yaw_deg is not None:
-                all_yaw_values.append(yaw_deg)
-
-            # Drooping: only use significant negative pitch (< -25°)
-            # Higher threshold because CCTV angle can cause baseline offset
-            if pitch_deg is not None and pitch_deg < -25:
-                head_drooping_indices.append(i)
-
-            if face.get("gaze_direction") == "down":
-                gaze_down_indices.append(i)
-
-            if face.get("yawn_status") == "YAWNING":
-                yawning_indices.append(i)
-
-    # --- Camera baseline calibration ---
-    # CCTV cameras are usually side-mounted, so the "normal" yaw is NOT 0°
-    # Compute median yaw as the baseline and measure DEVIATION from it
-    baseline_yaw = 0.0
-    baseline_pitch = 0.0
-    if all_yaw_values:
-        sorted_yaws = sorted(all_yaw_values)
-        baseline_yaw = sorted_yaws[len(sorted_yaws) // 2]  # Median
-    if all_pitch_values:
-        sorted_pitches = sorted(all_pitch_values)
-        baseline_pitch = sorted_pitches[len(sorted_pitches) // 2]
-
-    print(f"  Camera baseline: yaw={baseline_yaw:.1f}°, pitch={baseline_pitch:.1f}°")
-
-    # Now recompute head_turned using DEVIATION from baseline
-    for i, fa in enumerate(frame_analyses):
-        for face in fa["face_analysis"]["face_analyses"]:
-            yaw_deg = face.get("head_yaw_deg")
-            if yaw_deg is not None:
-                yaw_deviation = abs(yaw_deg - baseline_yaw)
-                if yaw_deviation > 30:  # More than 30° away from normal position
-                    head_turned_indices.append(i)
-
-    # Deduplicate (a frame can appear multiple times if multiple faces)
-    eyes_closed_indices = sorted(set(eyes_closed_indices))
-    eyes_partial_indices = sorted(set(eyes_partial_indices))
-    head_drooping_indices = sorted(set(head_drooping_indices))
-    head_turned_indices = sorted(set(head_turned_indices))
-    gaze_down_indices = sorted(set(gaze_down_indices))
-    yawning_indices = sorted(set(yawning_indices))
-    phone_indices = sorted(set(phone_indices))
-    bag_indices = sorted(set(bag_indices))
-    book_indices = sorted(set(book_indices))
-
-    # --- PERCLOS (Percentage of Eye CLOSure) ---
-    all_impaired = sorted(set(eyes_closed_indices + eyes_partial_indices))
-    perclos = len(all_impaired) / total if total > 0 else 0
-    consecutive_closed = find_max_consecutive(eyes_closed_indices, total)
-    consecutive_phone = find_max_consecutive(phone_indices, total)
-
-    # --- Helper to pick best evidence frame ---
-    def best_evidence(indices):
-        if not indices:
-            return None
-        # Prefer a frame in the middle of the longest run
-        return indices[len(indices) // 2]
-
-    def get_best_mobile_evidence(indices):
-        if not indices:
-            return None
-        best_idx = indices[len(indices) // 2]
-        min_y = float('inf')
-        for idx in indices:
-            for det in frame_analyses[idx].get("yolo_detections", []):
-                if det["class_name"] == "cell phone":
-                    y1 = det["bbox"][1]
-                    if y1 < min_y:
-                        min_y = y1
-                        best_idx = idx
-        return best_idx
-
-    def best_brake_horn_evidence(indices, target_class):
-        """Pick the frame with the highest confidence for the target brake/horn class."""
-        if not indices:
-            return None
-        best_idx = indices[0]
-        best_conf = 0.0
-        for idx in indices:
-            for det in frame_analyses[idx].get("brake_horn_detections", []):
-                if det["class_name"] == target_class and det["confidence"] > best_conf:
-                    best_conf = det["confidence"]
-                    best_idx = idx
-        return best_idx
-
-    parameters = {}
-
-    # ====== 1. ALERTNESS ======
-    drooping_pct = len(head_drooping_indices) / total
-    yawn_pct = len(yawning_indices) / total
-    alertness_score = perclos * 0.5 + drooping_pct * 0.3 + yawn_pct * 0.2
-
-    if alertness_score > 0.3 or perclos > 0.4:
-        alertness_status = "LOW"
-    elif alertness_score > 0.12 or perclos > 0.15:
-        alertness_status = "MODERATE"
     else:
-        alertness_status = "HIGH"
+        final_summary, final_recs, vlm_raw_outputs = local_summary, local_recs, []
+    PROFILER.stop({
+        "selected_events": sum(1 for c in event_candidates if c.needs_vlm),
+        "max_events": VLM_MAX_EVENTS,
+    })
 
-    alert_evidence = best_evidence(eyes_closed_indices or head_drooping_indices or yawning_indices)
-    if alertness_status == "LOW":
-        alert_desc = "Low. Crew members exhibited signs of fatigue and lack of focus. Extended periods of drooping head or closed eyes observed."
-    elif alertness_status == "MODERATE":
-        alert_desc = "Moderate. Crew showed occasional signs of reduced alertness, such as brief drooping or yawning, but maintained general awareness."
-    else:
-        alert_desc = "High. Crew members remained alert, maintaining upright posture and active engagement."
-
-    parameters["alertness"] = {
-        "key": "alertness", "label": "Crew Alertness", "icon": "🧠",
-        "description": alert_desc,
-        "status": alertness_status,
-        "confidence": "HIGH" if total > 20 else "MEDIUM",
-        "timestamp": "N/A",
-        "image_url": None,
-        "evidence_frame_idx": alert_evidence,
+    video_info = {
+        "filename": video_filename,
+        "duration": duration,
+        "fps": fps,
+        "frames_analyzed": len(frames),
+        "analysis_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
 
-    # ====== 2. DISTRACTION ======
-    # Based ONLY on head significantly turned from camera baseline
-    # gaze_down is NOT distraction — crew looks down at controls/instruments
-    distracted_pct = len(head_turned_indices) / total if total > 0 else 0
-    dist_evidence = best_evidence(head_turned_indices)
+    print("=" * 60)
+    print("STEP 6: Generating PDF report")
+    PROFILER.start("pdf")
+    pdf_path = generate_pdf_report(parameters, final_summary, final_recs, video_info)
+    PROFILER.stop()
+    total_time = time.time() - pipeline_start
+    PROFILER.add("TOTAL", total_time)
+
+    profile_payload = PROFILER.report()
+    profile_payload.update({
+        'video_info': video_info,
+        'final_parameters': parameters,
+        'event_candidates': [c.to_dict() for c in event_candidates],
+        'vlm_raw_outputs': vlm_raw_outputs,
+    })
+    profile_path = f'{PROFILE_DIR}/analysis_profile.json'
+    with open(profile_path, 'w') as f:
+        json.dump(profile_payload, f, indent=2)
+
+    print("=" * 60)
+    print("TIMING SUMMARY")
+    print("=" * 60)
+    for row in profile_payload['timings']:
+        print(f"  {row['stage']:<24}: {row['seconds']:7.2f}s ({row['calls']} calls)")
+    print()
+    print("FINAL RESULTS:")
+    for k, p in parameters.items():
+        icon = 'ALERT' if p['status'] in ('LOW', 'OBSERVED') else '  ok'
+        print(f"  [{icon}] {p['label']}: {p['status']} ({p['confidence']})")
+    print()
+    print(f"SUMMARY: {final_summary}")
+    print(f"PDF: {pdf_path}")
+    print(f"Profile JSON: {profile_path}")
+    print(f"Pipeline complete in {total_time:.1f}s")
+
+    result_text = f"Analysis complete in {total_time:.1f}s. {final_summary}"
+    return parameters, final_summary, final_recs, video_info, result_text, pdf_path
+
+def render_index(request: Request, **context):
+    ctx = {"request": request}
+    ctx.update(context)
+    if TEMPLATE_INDEX.exists():
+        return templates.TemplateResponse("index.html", ctx)
+    return HTMLResponse(build_fallback_html(ctx))
+
+def _esc(value):
+    return str(value).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+def build_fallback_html(ctx):
+    parameters = ctx.get("parameters") or {}
+    video_info = ctx.get("video_info") or {}
+    cards = []
+    for key, p in parameters.items():
+        img = p.get("image_url")
+        img_html = f'<img src="/{_esc(img)}" alt="evidence">' if img else ""
+        cards.append(f"""
+        <section class='card'>
+          <div class='row'><h3>{_esc(p.get('label', key))}</h3><span>{_esc(p.get('status', 'N/A'))}</span></div>
+          <p>{_esc(p.get('description', ''))}</p>
+          <small>Confidence: {_esc(p.get('confidence', 'N/A'))} | Time: {_esc(p.get('timestamp', 'N/A'))}</small>
+          {img_html}
+        </section>""")
+    return f"""<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
+    <title>Loco Pilot Crew Monitoring</title><style>
+    body{{margin:0;background:#f4f7fb;color:#111827;font-family:Arial,sans-serif}}.wrap{{max-width:1120px;margin:auto;padding:30px 20px}}
+    h1{{margin:0 0 16px}}form,.panel,.card{{background:white;border:1px solid #dbe3ef;border-radius:8px;padding:16px}}form{{display:flex;gap:12px;flex-wrap:wrap;align-items:center}}
+    input[type=file]{{flex:1;min-width:260px}}button,.btn{{background:#1d4ed8;color:white;border:0;border-radius:6px;padding:10px 14px;text-decoration:none}}
+    .panel{{margin:16px 0}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));gap:14px}}.row{{display:flex;justify-content:space-between;gap:10px}}
+    .row h3{{margin:0;font-size:16px}}.row span{{background:#e0ecff;color:#1d4ed8;border-radius:999px;padding:4px 8px;font-size:12px}}img{{width:100%;border-radius:6px;margin-top:10px}}
+    pre{{white-space:pre-wrap;background:#0f172a;color:#e5e7eb;padding:12px;border-radius:6px;overflow:auto}}</style></head><body><main class='wrap'>
+    <h1>Loco Pilot Crew Monitoring</h1>
+    <form action='/analyze' method='post' enctype='multipart/form-data'><input type='file' name='video' accept='video/*' required><button type='submit'>Analyze Video</button><a class='btn' href='/download-report'>Download PDF</a></form>
+    <section class='panel'><strong>{_esc(video_info.get('filename',''))}</strong><p>{_esc(ctx.get('overall_summary') or 'Upload a video to start analysis.')}</p><pre>{_esc(ctx.get('recommendations') or ctx.get('result') or '')}</pre></section>
+    <section class='grid'>{''.join(cards)}</section></main></body></html>"""
 
-    if distracted_pct > 0.3:
-        distraction_status = "HIGH"
-    elif distracted_pct > 0.15:
-        distraction_status = "MODERATE"
-    elif distracted_pct > 0.08:
-        distraction_status = "LOW"
-    else:
-        distraction_status = "NONE"
-
-    if distraction_status == "HIGH":
-        dist_desc = "High. A crew member was observed looking away from the track frequently, focusing on other directions for extended periods."
-    elif distraction_status == "MODERATE":
-        dist_desc = "Moderate. A crew member occasionally turned their head away from the forward view, indicating some level of divided attention."
-    elif distraction_status == "LOW":
-        dist_desc = "Low. Minor head turns observed, likely for checking necessary operational displays or surroundings."
-    else:
-        dist_desc = "None. Crew maintained forward focus without significant distraction."
-
-    parameters["distraction"] = {
-        "key": "distraction", "label": "Crew Distraction", "icon": "👀",
-        "description": dist_desc,
-        "status": distraction_status,
-        "confidence": "HIGH" if total > 20 else "MEDIUM",
-        "timestamp": "N/A",
-        "image_url": None,
-        "evidence_frame_idx": dist_evidence,
-    }
-
-    # ====== 3. WRITING ======
-    writing_frames = sorted(set(book_indices) & set(gaze_down_indices))
-    writing_only_book = book_indices  # Book alone is also evidence
-
-    if len(writing_frames) >= 3:
-        writing_status = "OBSERVED"
-        writing_conf = "HIGH"
-    if len(writing_frames) >= 3:
-        writing_status = "OBSERVED"
-        writing_conf = "HIGH"
-        writing_desc = "Observed. A crew member was seen actively focused downward on paperwork or a document while the locomotive was in motion."
-    elif len(writing_only_book) >= 3:
-        writing_status = "OBSERVED"
-        writing_conf = "MEDIUM"
-        writing_desc = "Observed. Books or documents were present and crew attention appeared directed towards them."
-    elif len(writing_only_book) >= 1:
-        writing_status = "OBSERVED"
-        writing_conf = "LOW"
-        writing_desc = "Observed. Writing materials were visible, though active writing was brief or unclear."
-    else:
-        writing_status = "NOT_OBSERVED"
-        writing_conf = "HIGH"
-        writing_desc = "Not Observed. No writing materials were detected and no crew member was seen doing writing work."
-
-    parameters["writing"] = {
-        "key": "writing", "label": "Crew Doing Writing Work", "icon": "✍️",
-        "description": writing_desc,
-        "status": writing_status,
-        "confidence": writing_conf,
-        "timestamp": "N/A",
-        "image_url": None,
-        "evidence_frame_idx": best_evidence(writing_frames or writing_only_book),
-    }
-
-    # ====== 4. NAP / MICRO-SLEEP ======
-    if consecutive_closed >= 5:
-        nap_status = "OBSERVED"
-        nap_conf = "HIGH"
-    if consecutive_closed >= 5:
-        nap_status = "OBSERVED"
-        nap_conf = "HIGH"
-        nap_desc = "Observed. A crew member appeared to be in a state of sleep, with prolonged periods of closed eyes."
-    elif consecutive_closed >= 3:
-        nap_status = "OBSERVED"
-        nap_conf = "MEDIUM"
-        nap_desc = "Observed. A crew member exhibited signs of micro-sleep or deep rest with eyes closed multiple times."
-    elif perclos > 0.4:
-        nap_status = "OBSERVED"
-        nap_conf = "MEDIUM"
-        nap_desc = "Observed. High frequency of prolonged eye closure indicates possible micro-sleep."
-    else:
-        nap_status = "NOT_OBSERVED"
-        nap_conf = "HIGH"
-        nap_desc = "Not Observed. No significant evidence of napping or prolonged eye closure was seen."
-
-    parameters["nap"] = {
-        "key": "nap", "label": "Crew Taking Nap / Micro-sleep", "icon": "😴",
-        "description": nap_desc,
-        "status": nap_status,
-        "confidence": nap_conf,
-        "timestamp": "N/A",
-        "image_url": None,
-        "evidence_frame_idx": best_evidence(eyes_closed_indices),
-    }
-
-    # ====== 5. MOBILE ======
-    if len(phone_indices) >= 3 and consecutive_phone >= 2:
-        mobile_status = "OBSERVED"
-        mobile_conf = "HIGH"
-        mobile_desc = "Observed. A crew member was seen actively using or holding a mobile phone during the monitored period."
-    elif len(phone_indices) >= 2:
-        mobile_status = "OBSERVED"
-        mobile_conf = "MEDIUM"
-        mobile_desc = "Observed. Evidence suggests brief use or checking of a mobile phone by a crew member."
-    elif len(phone_indices) == 1:
-        mobile_status = "NOT_OBSERVED"
-        mobile_conf = "MEDIUM"
-        mobile_desc = "Not Observed. Although a device was visible briefly, sustained usage was not confirmed."
-    else:
-        mobile_status = "NOT_OBSERVED"
-        mobile_conf = "HIGH"
-        mobile_desc = "Not Observed. Neither crew member was seen using a mobile phone during the recorded period."
-
-    # Check for phone-like posture (gaze down + hand position) even without direct detection
-    gaze_down_no_book = sorted(set(gaze_down_indices) - set(book_indices))
-    if len(gaze_down_no_book) > total * 0.2 and mobile_status == "NOT_OBSERVED":
-        mobile_desc += " Note: Prolonged downward gaze observed without visible documents, suggesting possible hidden phone use."
-
-    parameters["mobile"] = {
-        "key": "mobile", "label": "Crew Using Mobile", "icon": "📱",
-        "description": mobile_desc,
-        "status": mobile_status,
-        "confidence": mobile_conf,
-        "timestamp": "N/A",
-        "image_url": None,
-        "evidence_frame_idx": get_best_mobile_evidence(phone_indices),
-    }
-
-    # ====== 6. PACKING ======
-
-
-    if len(bag_indices) > 0:
-        packing_status = "NOT_OBSERVED"
-        packing_conf = "LOW"
-        packing_desc = "Not Observed. Bags or belongings were detected in the cab, but they appear to be stationary."
-    else:
-        packing_status = "NOT_OBSERVED"
-        packing_conf = "HIGH"
-        packing_desc = "Not Observed. No crew member was seen actively packing bags or gathering personal items."
-
-    parameters["packing"] = {
-        "key": "packing", "label": "Crew Packing Belongings", "icon": "🎒",
-        "description": packing_desc,
-        "status": packing_status,
-        "confidence": packing_conf,
-        "timestamp": "N/A",
-        "image_url": None,
-        "evidence_frame_idx": best_evidence(bag_indices),
-    }
-
-    # ====== 7. LEAVING PLACE ======
-    # Track person count changes
-    leaving_evidence = None
-    if len(person_counts) >= 3:
-        # Check if person count drops and stays low
-        initial_count = max(person_counts[:min(5, len(person_counts))])  # Max in first 5 frames
-        min_count = min(person_counts)
-        drop_indices = [i for i, c in enumerate(person_counts) if c < initial_count]
-        sustained_drop = find_max_consecutive(drop_indices, total)
-
-        if initial_count >= 2 and min_count <= initial_count - 1 and sustained_drop >= 3:
-            leaving_status = "OBSERVED"
-            leaving_conf = "HIGH" if sustained_drop >= 5 else "MEDIUM"
-            leaving_desc = "Observed. A crew member vacated their position and left the designated seat area."
-            leaving_evidence = best_evidence(drop_indices)
-        elif initial_count >= 2 and min_count < initial_count:
-            leaving_status = "OBSERVED"
-            leaving_conf = "LOW"
-            leaving_desc = "Observed. Possible brief absence of a crew member from their designated monitoring position."
-            leaving_evidence = best_evidence(drop_indices)
-        else:
-            leaving_status = "NOT_OBSERVED"
-            leaving_conf = "HIGH"
-            leaving_desc = "Not Observed. Both crew members remained in their designated seats or expected operational areas."
-    else:
-        leaving_status = "NOT_OBSERVED"
-        leaving_conf = "LOW"
-        leaving_desc = "Insufficient frames to track person count changes."
-
-    parameters["leaving"] = {
-        "key": "leaving", "label": "Crew Leaving Place", "icon": "🚪",
-        "description": leaving_desc,
-        "status": leaving_status,
-        "confidence": leaving_conf,
-        "timestamp": "N/A",
-        "image_url": None,
-        "evidence_frame_idx": leaving_evidence,
-    }
-
-    # --- Auto-flag leaving AND packing if person count drops to 0 in last 60 seconds ---
-    if len(person_counts) >= 5:
-        last_timestamp = frame_analyses[-1]["timestamp"]
-        cutoff_time = max(0, last_timestamp - 60)  # Last 60 seconds
-        final_zero_indices = [
-            i for i in range(total)
-            if person_counts[i] == 0 and frame_analyses[i]["timestamp"] >= cutoff_time
-        ]
-
-        if len(final_zero_indices) >= 2:
-            # Empty cab at the end — crew has left (and likely packed)
-            if parameters["leaving"]["status"] != "OBSERVED":
-                parameters["leaving"]["status"] = "OBSERVED"
-                parameters["leaving"]["confidence"] = "HIGH" if len(final_zero_indices) >= 3 else "MEDIUM"
-                parameters["leaving"]["description"] = (
-                    f"Cab completely empty (0 persons) in {len(final_zero_indices)} frames "
-                    f"in the final portion of the video. Crew has left the cab."
-                )
-                parameters["leaving"]["evidence_frame_idx"] = final_zero_indices[-1]
-
-            if parameters["packing"]["status"] != "OBSERVED":
-                parameters["packing"]["status"] = "OBSERVED"
-                parameters["packing"]["confidence"] = "MEDIUM"
-                parameters["packing"]["description"] = (
-                    f"Cab vacated with 0 persons detected in final {len(final_zero_indices)} frames. "
-                    f"Crew likely packed belongings before leaving."
-                )
-                parameters["packing"]["evidence_frame_idx"] = final_zero_indices[0]
-
-    # --- If crew leaving is OBSERVED, auto-flag packing too ---
-    if parameters["leaving"]["status"] == "OBSERVED" and parameters["packing"]["status"] != "OBSERVED":
-        parameters["packing"]["status"] = "OBSERVED"
-        parameters["packing"]["confidence"] = "MEDIUM"
-        parameters["packing"]["description"] = (
-            "Crew leaving detected — crew likely packed belongings before departing. "
-            + parameters["packing"]["description"]
-        )
-        if not parameters["packing"].get("evidence_frame_idx"):
-            parameters["packing"]["evidence_frame_idx"] = parameters["leaving"].get("evidence_frame_idx")
-
-    # ====== 8. HORN OPERATION (Custom YOLO) ======
-    horn_active_indices = sorted(set(horn_active_indices))
-    consecutive_horn = find_max_consecutive(horn_active_indices, total)
-
-    if len(horn_active_indices) >= 3 and consecutive_horn >= 2:
-        horn_status = "OBSERVED"
-        horn_conf = "HIGH"
-        horn_desc = f"Horn lever active detected by custom YOLO in {len(horn_active_indices)}/{total} frames ({consecutive_horn} consecutive). Strong evidence of horn operation."
-    elif len(horn_active_indices) >= 2:
-        horn_status = "OBSERVED"
-        horn_conf = "MEDIUM"
-        horn_desc = f"Horn lever active detected by custom YOLO in {len(horn_active_indices)} frames. Likely horn operation."
-    elif len(horn_active_indices) == 1:
-        horn_status = "OBSERVED"
-        horn_conf = "LOW"
-        horn_desc = f"Horn lever active detected in only 1 frame — brief horn usage."
-    else:
-        horn_status = "NOT_OBSERVED"
-        horn_conf = "HIGH" if BRAKE_HORN_AVAILABLE else "LOW"
-        horn_desc = "No horn lever activation detected by custom YOLO in any frame." if BRAKE_HORN_AVAILABLE else "Brake/Horn YOLO model not available."
-
-    parameters["horn"] = {
-        "key": "horn", "label": "Crew Operating Horn Lever/Switch", "icon": "📯",
-        "description": horn_desc,
-        "status": horn_status,
-        "confidence": horn_conf,
-        "timestamp": "N/A",
-        "image_url": None,
-        "evidence_frame_idx": best_brake_horn_evidence(horn_active_indices, "horn_active"),
-    }
-
-    # ====== 9. BRAKE A9/SA9 APPLICATION (Custom YOLO) ======
-    brake_applied_indices = sorted(set(brake_applied_indices))
-    consecutive_brake = find_max_consecutive(brake_applied_indices, total)
-
-    if len(brake_applied_indices) >= 3 and consecutive_brake >= 2:
-        brake_status = "OBSERVED"
-        brake_conf = "HIGH"
-        brake_desc = f"A9/SA9 brake application detected by custom YOLO in {len(brake_applied_indices)}/{total} frames ({consecutive_brake} consecutive). Strong evidence of brake application."
-    elif len(brake_applied_indices) >= 2:
-        brake_status = "OBSERVED"
-        brake_conf = "MEDIUM"
-        brake_desc = f"A9/SA9 brake application detected by custom YOLO in {len(brake_applied_indices)} frames. Likely brake application."
-    elif len(brake_applied_indices) == 1:
-        brake_status = "OBSERVED"
-        brake_conf = "LOW"
-        brake_desc = f"Brake application detected in only 1 frame — brief or transitional."
-    else:
-        brake_status = "NOT_OBSERVED"
-        brake_conf = "HIGH" if BRAKE_HORN_AVAILABLE else "LOW"
-        brake_desc = "No A9/SA9 brake application detected by custom YOLO in any frame." if BRAKE_HORN_AVAILABLE else "Brake/Horn YOLO model not available."
-
-    parameters["brake_a9"] = {
-        "key": "brake_a9", "label": "LP Applying A9/SA9 After Halt", "icon": "🛑",
-        "description": brake_desc,
-        "status": brake_status,
-        "confidence": brake_conf,
-        "timestamp": "N/A",
-        "image_url": None,
-        "evidence_frame_idx": best_brake_horn_evidence(brake_applied_indices, "brake_applied"),
-    }
-
-    # --- Save evidence images ---
-    for key, param in parameters.items():
-        idx = param.get("evidence_frame_idx")
-        status = param.get("status", "")
-        # Only save evidence if flagged
-        if status in ["NOT_OBSERVED", "NONE"] or (key == "alertness" and status == "HIGH"):
-            param["evidence_frame_idx"] = None
-            continue
-
-        if idx is not None and 0 <= idx < total:
-            source_path = frame_analyses[idx].get("annotated_path", frame_analyses[idx]["frame_path"])
-            config = PARAMETER_CONFIG.get(next((k for k, v in PARAMETER_CONFIG.items() if v["key"] == key), ""), {})
-            if config:
-                param["image_url"] = save_detection_image(
-                    source_path, None,
-                    config.get("bbox_label", key.upper()),
-                    config.get("bbox_color", (255, 255, 255)),
-                    config.get("prefix", key)
-                )
-
-    # --- Overall summary ---
-    issues = []
-    if alertness_status == "LOW":
-        issues.append("low crew alertness")
-    if nap_status == "OBSERVED":
-        issues.append("napping/micro-sleep detected")
-    if mobile_status == "OBSERVED":
-        issues.append("mobile phone usage")
-    if distraction_status in ["HIGH", "MODERATE"]:
-        issues.append(f"{distraction_status.lower()} distraction")
-    if leaving_status == "OBSERVED":
-        issues.append("crew member leaving position")
-    if writing_status == "OBSERVED":
-        issues.append("writing work during duty")
-    if packing_status == "OBSERVED":
-        issues.append("packing belongings")
-    if horn_status == "OBSERVED":
-        issues.append("horn lever operation detected")
-    if brake_status == "OBSERVED":
-        issues.append("A9/SA9 brake application detected")
-
-    if not issues:
-        overall_summary = f"Analysis of {total} frames shows generally safe crew behavior. Alertness is {alertness_status}, no critical safety violations detected."
-    else:
-        overall_summary = f"Analysis of {total} frames flagged {len(issues)} concern(s): {', '.join(issues)}. Immediate review recommended."
-
-    # --- Recommendations ---
-    recs = []
-    if alertness_status != "HIGH":
-        recs.append(f"- Monitor crew alertness levels (PERCLOS={perclos:.0%}). Consider alertness management interventions.")
-    if nap_status == "OBSERVED":
-        recs.append("- CRITICAL: Napping/micro-sleep detected. Immediate intervention required for safety.")
-    if mobile_status == "OBSERVED":
-        recs.append("- Enforce strict no-phone policy during locomotive operation.")
-    if distraction_status in ["HIGH", "MODERATE"]:
-        recs.append("- Address crew distraction. Remind crew to maintain focus on track and controls.")
-    if leaving_status == "OBSERVED":
-        recs.append("- Investigate why crew member left their position. Ensure minimum staffing requirements.")
-    if horn_status == "OBSERVED":
-        recs.append("- Horn lever operation detected. Verify appropriate horn usage per operating rules.")
-    if brake_status == "OBSERVED":
-        recs.append("- A9/SA9 brake application after halt detected. Confirm proper braking procedure followed.")
-    if not recs:
-        recs.append("- Continue monitoring. Overall crew behavior appears compliant with safety standards.")
-    recommendations = "\n".join(recs)
-
-    return parameters, overall_summary, recommendations
-
-
-# =========================
-# GEMINI DENSE ANALYSIS (every 7 seconds)
-# =========================
-GEMINI_FRAME_INTERVAL = 4  # Analyze one frame every 4 seconds
-
-GEMINI_PER_FRAME_PROMPT = """Analyze this locomotive cab CCTV frame for crew safety monitoring. 
-For EACH of the 9 parameters below, provide your assessment.
-Reply in EXACTLY this format (one line per parameter):
-
-ALERTNESS: HIGH/MODERATE/LOW | <brief reason>
-DISTRACTION: YES/NO | <brief reason>
-WRITING: YES/NO | <brief reason>
-NAPPING: YES/NO | <brief reason>
-MOBILE_PHONE: YES/NO | <brief reason>
-PACKING: YES/NO | <brief reason>
-LEAVING: YES/NO | <brief reason>
-HORN: YES/NO | <brief reason>
-BRAKE_A9: YES/NO | <brief reason>
-
-Rules:
-- ALERTNESS: Are crew members alert, eyes open, posture upright, engaged with controls?
-- DISTRACTION: Is anyone looking away from track/controls, turned around, not focused on duties?
-- WRITING: Say YES ONLY if you can clearly see a person actively writing on paper with a pen/pencil, or reading a physical document/book. Do NOT confuse instruments, control panels, gauges, or dashboards as writing materials. Operating controls is NOT writing.
-- NAPPING: Are eyes closed, head drooping, slumped posture? Signs of sleep?
-- MOBILE_PHONE: Is ANYONE (including crew members standing in the background or partially obscured) actively holding, looking at, or using a mobile phone? You MUST scan ALL visible people in the entire cab. STRICTLY report NO if the phone is merely resting in a pocket, bag, or on a desk without being actively used.
-- PACKING: Is anyone handling bags, picking up personal items, organizing belongings, or preparing to leave? Look for bags being moved, items being gathered, crew standing up to collect things. Also say YES if seats appear recently vacated with belongings missing compared to normal.
-- LEAVING: Is any crew seat EMPTY that was previously occupied? Is someone standing, walking to the door, or at the exit? Is the cab partially or fully vacated? Fewer crew visible than expected (normally 2)? If you see an EMPTY CAB with no crew, this is definitely YES.
-- HORN: Is any crew member reaching for, pressing, or operating the horn lever/switch? Look for hand on or near the horn lever (usually located on the upper portion of the control panel/console).
-- BRAKE_A9: Is the Loco Pilot (LP) applying the A9 or SA9 brake handle? Look for the LP's hand on the brake handle, the brake handle in the applied/pulled position.
-
-Be accurate. If unsure, lean toward NO for safety-critical items except ALERTNESS."""
-
-
-def parse_gemini_per_frame(text):
-    """Parse Gemini's structured per-frame response into a dict."""
-    result = {}
-    lines = text.strip().split("\n")
-    for line in lines:
-        line = line.strip()
-        if not line or ":" not in line:
-            continue
-        # Parse "PARAMETER: VALUE | reason"
-        parts = line.split(":", 1)
-        if len(parts) < 2:
-            continue
-        key = parts[0].strip().upper()
-        rest = parts[1].strip()
-        
-        # Extract value and reason
-        if "|" in rest:
-            value, reason = rest.split("|", 1)
-            value = value.strip().upper()
-            reason = reason.strip()
-        else:
-            value = rest.strip().upper()
-            reason = ""
-
-        key_map = {
-            "ALERTNESS": "alertness",
-            "DISTRACTION": "distraction",
-            "WRITING": "writing",
-            "NAPPING": "nap",
-            "MOBILE_PHONE": "mobile",
-            "MOBILE PHONE": "mobile",
-            "PACKING": "packing",
-            "LEAVING": "leaving",
-            "HORN": "horn",
-            "BRAKE_A9": "brake_a9",
-            "BRAKE A9": "brake_a9",
-        }
-        mapped_key = key_map.get(key)
-        if mapped_key:
-            result[mapped_key] = {"value": value, "reason": reason}
-    return result
-
-
-def analyze_with_gemini_dense(parameters, frame_analyses):
-    """Send one frame every 7 seconds to Gemini for comprehensive per-frame analysis.
-    Aggregates Gemini votes across all frames to determine final parameter statuses.
-    Merges with local CV data for maximum accuracy."""
-    total = len(frame_analyses)
-    if total == 0:
-        return parameters, "No frames to analyze."
-
-    # Select frames strictly every GEMINI_FRAME_INTERVAL seconds, PLUS dense at the end
-    gemini_indices = []
-    next_target_time = 0
-    last_timestamp = frame_analyses[-1]["timestamp"] if frame_analyses else 0
-    dense_start_time = max(0, last_timestamp - 8)
-
-    for i, fa in enumerate(frame_analyses):
-        ts = fa["timestamp"]
-        if ts >= dense_start_time:
-            gemini_indices.append(i)
-        elif ts >= next_target_time:
-            gemini_indices.append(i)
-            next_target_time = ts + GEMINI_FRAME_INTERVAL
-
-    gemini_indices = sorted(set(gemini_indices))
-    print(f"  Sending {len(gemini_indices)} frames to Gemini (every {GEMINI_FRAME_INTERVAL}s + dense end)...")
-
-    # Per-frame Gemini results
-    gemini_votes = {
-        "alertness": [],   # list of "HIGH"/"MODERATE"/"LOW"
-        "distraction": [],  # list of "YES"/"NO"
-        "writing": [],
-        "nap": [],
-        "mobile": [],
-        "packing": [],
-        "leaving": [],
-        "horn": [],
-        "brake_a9": [],
-    }
-    gemini_reasons = {k: [] for k in gemini_votes}
-    gemini_evidence = {k: [] for k in gemini_votes}  # List of all YES indices
-
-    result_text_parts = []
-
-    for idx in gemini_indices:
-        fa = frame_analyses[idx]
-        frame_path = fa["frame_path"]
-        timestamp = fa["timestamp"]
-
-        try:
-            img = Image.open(frame_path)
-            response = model.generate_content([GEMINI_PER_FRAME_PROMPT, img])
-            resp_text = response.text.strip()
-
-            parsed = parse_gemini_per_frame(resp_text)
-
-            status_line = f"  Frame {idx} ({timestamp}s): "
-            flags = []
-
-            for param_key in gemini_votes:
-                if param_key in parsed:
-                    value = parsed[param_key]["value"]
-                    reason = parsed[param_key]["reason"]
-                    gemini_votes[param_key].append(value)
-                    gemini_reasons[param_key].append(reason)
-
-                    # Track evidence frames for flagged items
-                    if param_key == "alertness" and value in ["LOW", "MODERATE"]:
-                        gemini_evidence[param_key].append(idx)
-                        flags.append(f"alert={value}")
-                    elif param_key != "alertness" and value == "YES":
-                        gemini_evidence[param_key].append(idx)
-                        flags.append(param_key)
-
-            flag_str = ", ".join(flags) if flags else "OK"
-            print(f"{status_line}{flag_str}")
-
-        except Exception as e:
-            print(f"  Frame {idx} ({timestamp}s): Gemini error: {e}")
-            result_text_parts.append(f"Frame {idx}: error - {e}")
-
-    # --- Aggregate Gemini votes into final parameters ---
-    gemini_total = len(gemini_indices)
-    print(f"\n  Aggregating {gemini_total} Gemini frame analyses...")
-
-    # 1. ALERTNESS — use Gemini vote distribution
-    if gemini_votes["alertness"]:
-        low_count = sum(1 for v in gemini_votes["alertness"] if v == "LOW")
-        mod_count = sum(1 for v in gemini_votes["alertness"] if v == "MODERATE")
-        high_count = sum(1 for v in gemini_votes["alertness"] if v == "HIGH")
-        
-        if low_count > gemini_total * 0.2:
-            gemini_alertness = "LOW"
-        elif (low_count + mod_count) > gemini_total * 0.3:
-            gemini_alertness = "MODERATE"
-        else:
-            gemini_alertness = "HIGH"
-        
-        parameters["alertness"]["status"] = gemini_alertness
-        # Description is already set by local CV, we'll keep it or let Gemini overwrite it later
-        if gemini_evidence["alertness"]:
-            parameters["alertness"]["evidence_frame_idx"] = gemini_evidence["alertness"][0]
-
-    # For binary parameters (YES/NO), use Gemini vote counts
-    binary_params = {
-        "distraction": {"label": "Crew Distraction", "threshold": 0.2},
-        "writing": {"label": "Crew Doing Writing Work", "threshold": 0.01},
-        "nap": {"label": "Crew Taking Nap / Micro-sleep", "threshold": 0.02},
-        "mobile": {"label": "Crew Using Mobile", "threshold": 0.05},
-        "packing": {"label": "Crew Packing Belongings", "threshold": 0.02},
-        "leaving": {"label": "Crew Leaving Place", "threshold": 0.02},
-        "horn": {"label": "Crew Operating Horn Lever/Switch", "threshold": 0.1},
-        "brake_a9": {"label": "LP Applying A9/SA9 After Halt", "threshold": 0.1},
-    }
-
-    for param_key, config in binary_params.items():
-        votes = gemini_votes[param_key]
-        if not votes:
-            continue
-
-        # For horn and brake_a9: if custom YOLO model already detected them as OBSERVED,
-        # keep the YOLO results — they are more reliable than Gemini for these specific classes.
-        # Only let Gemini override if YOLO did NOT detect them or model wasn't available.
-        if param_key in ("horn", "brake_a9"):
-            current_status = parameters.get(param_key, {}).get("status", "")
-            if current_status == "OBSERVED" and BRAKE_HORN_AVAILABLE:
-                # Custom YOLO already detected this — append Gemini info but don't override
-                yes_count = sum(1 for v in votes if v == "YES")
-                yes_pct = yes_count / len(votes) if votes else 0
-                # Custom YOLO already detected this
-                if yes_count > 0:
-                    pass # We do not alter description, keep local human-readable text
-                continue
-
-        # For packing and leaving: if local CV already flagged as OBSERVED (e.g. zero-person rule),
-        # don't let Gemini override back to NOT_OBSERVED.
-        if param_key in ("packing", "leaving"):
-            current_status = parameters.get(param_key, {}).get("status", "")
-            if current_status == "OBSERVED":
-                yes_count = sum(1 for v in votes if v == "YES")
-                yes_pct = yes_count / len(votes) if votes else 0
-                # Already observed locally, do not append model internal details
-                continue
-
-        yes_count = sum(1 for v in votes if v == "YES")
-        yes_pct = yes_count / len(votes) if votes else 0
-        
-        if param_key == "mobile":
-            if yes_count >= 2:
-                gemini_status = "OBSERVED"
-                conf = "HIGH"
-            else:
-                gemini_status = "NOT_OBSERVED"
-                conf = "MEDIUM" if yes_count == 1 else "HIGH"
-        elif yes_pct >= config["threshold"]:
-            gemini_status = "OBSERVED"
-            if yes_count >= 3:
-                conf = "HIGH"
-            elif yes_count >= 2:
-                conf = "MEDIUM"
-            else:
-                conf = "LOW"
-        else:
-            gemini_status = "NOT_OBSERVED"
-            conf = "HIGH" if yes_count == 0 else "MEDIUM"
-
-        # Collect Gemini reasons for YES frames
-        yes_reasons = [r for v, r in zip(votes, gemini_reasons[param_key]) if v == "YES" and r]
-        reason_str = " | ".join(yes_reasons[:3]) if yes_reasons else "No specific evidence."
-
-        # For horn/brake_a9 when YOLO didn't detect: let Gemini set the status
-        parameters[param_key]["status"] = gemini_status
-        parameters[param_key]["confidence"] = conf
-        
-        if gemini_status == "OBSERVED":
-            yes_indices = gemini_evidence[param_key]
-            if param_key == "mobile" and yes_indices:
-                # Find the frame where the phone is highest up among the Gemini YES frames
-                best_idx = yes_indices[len(yes_indices)//2]
-                min_y = float('inf')
-                for idx in yes_indices:
-                    for det in frame_analyses[idx].get("yolo_detections", []):
-                        if det["class_name"] == "cell phone":
-                            y1 = det["bbox"][1]
-                            if y1 < min_y:
-                                min_y = y1
-                                best_idx = idx
-                parameters[param_key]["evidence_frame_idx"] = best_idx
-            elif yes_indices:
-                parameters[param_key]["evidence_frame_idx"] = yes_indices[0]
-        
-        # Use a human-readable description instead of the raw analysis metrics
-        if param_key == "alertness":
-            if parameters[param_key]["status"] == "LOW":
-                desc = "Low. Crew members exhibited signs of fatigue and lack of focus. Extended periods of drooping head or closed eyes observed."
-            elif parameters[param_key]["status"] == "MODERATE":
-                desc = "Moderate. Crew showed occasional signs of reduced alertness, such as brief drooping or yawning, but maintained general awareness."
-            else:
-                desc = "High. Crew members remained alert, maintaining upright posture and active engagement."
-        elif param_key == "distraction":
-            if parameters[param_key]["status"] in ["HIGH", "OBSERVED"]:
-                desc = "High. A crew member was observed looking away from the track frequently, focusing on other directions for extended periods."
-            else:
-                desc = "Not Observed. Crew maintained forward focus without significant distraction."
-        elif param_key == "writing":
-            if parameters[param_key]["status"] == "OBSERVED":
-                desc = "Observed. A crew member was seen actively focused downward on paperwork or a document while the locomotive was in motion."
-            else:
-                desc = "Not Observed. No crew member was seen doing writing work."
-        elif param_key == "nap":
-            if parameters[param_key]["status"] == "OBSERVED":
-                desc = "Observed. A crew member appeared to be in a state of sleep, with prolonged periods of closed eyes."
-            else:
-                desc = "Not Observed. No significant evidence of napping or prolonged eye closure was seen."
-        elif param_key == "mobile":
-            if parameters[param_key]["status"] == "OBSERVED":
-                desc = "Observed. A crew member was seen actively using or holding a mobile phone during the monitored period."
-            else:
-                desc = "Not Observed. Neither crew member was seen using a mobile phone during the recorded period."
-        elif param_key == "packing":
-            if parameters[param_key]["status"] == "OBSERVED":
-                desc = "Observed. Activity indicating handling of personal belongings or packing bags was noted."
-            else:
-                desc = "Not Observed. No crew member was seen actively packing bags or gathering personal items."
-        elif param_key == "leaving":
-            if parameters[param_key]["status"] == "OBSERVED":
-                desc = "Observed. A crew member vacated their position and left the designated seat area."
-            else:
-                desc = "Not Observed. Both crew members remained in their designated seats or expected operational areas."
-        elif param_key == "horn":
-            if parameters[param_key]["status"] == "OBSERVED":
-                desc = "Observed. A crew member was seen operating the horn lever/switch."
-            else:
-                desc = "Not Observed. No horn lever activation was detected."
-        elif param_key == "brake_a9":
-            if parameters[param_key]["status"] == "OBSERVED":
-                desc = "Observed. The Loco Pilot was seen applying the A9/SA9 brake handle."
-            else:
-                desc = "Not Observed. No A9/SA9 brake application was detected."
-        else:
-            desc = parameters[param_key]["description"]
-            
-        parameters[param_key]["description"] = desc
-
-    # --- Save evidence images ---
-    for key, param in parameters.items():
-        idx = param.get("evidence_frame_idx")
-        status = param.get("status", "")
-        # Only save evidence if flagged
-        if status in ["NOT_OBSERVED", "NONE"] or (key == "alertness" and status == "HIGH"):
-            param["evidence_frame_idx"] = None
-            continue
-
-        if idx is not None and 0 <= idx < total:
-            source_path = frame_analyses[idx].get("annotated_path", frame_analyses[idx]["frame_path"])
-            param["image_url"] = save_detection_image(
-                source_path, None, key.upper(), (0, 0, 255), key
-            )
-
-    # --- Regenerate summary and recommendations ---
-    issues = []
-    if parameters.get("alertness", {}).get("status") == "LOW":
-        issues.append("low crew alertness")
-    if parameters.get("nap", {}).get("status") == "OBSERVED":
-        issues.append("napping/micro-sleep detected")
-    if parameters.get("mobile", {}).get("status") == "OBSERVED":
-        issues.append("mobile phone usage")
-    if parameters.get("distraction", {}).get("status") == "OBSERVED":
-        issues.append("crew distraction")
-    if parameters.get("leaving", {}).get("status") == "OBSERVED":
-        issues.append("crew leaving position")
-    if parameters.get("writing", {}).get("status") == "OBSERVED":
-        issues.append("writing work during duty")
-    if parameters.get("packing", {}).get("status") == "OBSERVED":
-        issues.append("packing belongings")
-    if parameters.get("horn", {}).get("status") == "OBSERVED":
-        issues.append("horn lever operation detected")
-    if parameters.get("brake_a9", {}).get("status") == "OBSERVED":
-        issues.append("A9/SA9 brake application detected")
-
-    if not issues:
-        overall_summary = "Analysis complete. Generally safe crew behavior. No critical violations."
-    else:
-        overall_summary = f"Analysis flagged {len(issues)} concern(s): {', '.join(issues)}."
-
-    recs = []
-    if parameters.get("alertness", {}).get("status") != "HIGH":
-        recs.append("- Monitor crew alertness levels. Consider breaks or interventions.")
-    if parameters.get("nap", {}).get("status") == "OBSERVED":
-        recs.append("- CRITICAL: Napping detected. Immediate intervention required.")
-    if parameters.get("mobile", {}).get("status") == "OBSERVED":
-        recs.append("- Enforce no-phone policy during locomotive operation.")
-    if parameters.get("distraction", {}).get("status") == "OBSERVED":
-        recs.append("- Address crew distraction. Remind crew to focus on track and controls.")
-    if parameters.get("leaving", {}).get("status") == "OBSERVED":
-        recs.append("- Investigate crew member leaving position. Ensure minimum staffing.")
-    if parameters.get("horn", {}).get("status") == "OBSERVED":
-        recs.append("- Horn lever operation detected. Verify appropriate horn usage per operating rules.")
-    if parameters.get("brake_a9", {}).get("status") == "OBSERVED":
-        recs.append("- A9/SA9 brake application after halt detected. Confirm proper braking procedure followed.")
-    if not recs:
-        recs.append("- Continue monitoring. Crew behavior appears compliant.")
-    recommendations = "\n".join(recs)
-
-    result_text = f"Analysis complete. {overall_summary}"
-    return parameters, overall_summary, recommendations, result_text
-
-
-# =========================
-# BOUNDING BOX DRAWING (for Gemini response parsing)
-# =========================
-def draw_bounding_box(image_path, bbox_coords, label, color):
-    img = cv2.imread(image_path)
-    if img is None:
-        return image_path
-    h, w, _ = img.shape
-    x_min = int(bbox_coords.get('x_min', 0) * w / 1000)
-    y_min = int(bbox_coords.get('y_min', 0) * h / 1000)
-    x_max = int(bbox_coords.get('x_max', 1000) * w / 1000)
-    y_max = int(bbox_coords.get('y_max', 1000) * h / 1000)
-    x_min = max(0, min(x_min, w))
-    y_min = max(0, min(y_min, h))
-    x_max = max(0, min(x_max, w))
-    y_max = max(0, min(y_max, h))
-    cv2.rectangle(img, (x_min, y_min), (x_max, y_max), color, 3)
-    label_size, baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
-    cv2.rectangle(img, (x_min, y_min - label_size[1] - 10),
-                  (x_min + label_size[0] + 10, y_min), color, -1)
-    cv2.putText(img, label, (x_min + 5, y_min - 5),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-    return img
-
-
-# =========================
-# PARSE HELPERS
-# =========================
-def parse_bbox(bbox_text):
-    if not bbox_text or bbox_text.strip().upper() == 'NONE':
-        return None
-    try:
-        numbers = re.findall(r'\d+', bbox_text)
-        if len(numbers) >= 4:
-            return {
-                'x_min': int(numbers[0]),
-                'y_min': int(numbers[1]),
-                'x_max': int(numbers[2]),
-                'y_max': int(numbers[3])
-            }
-    except Exception as e:
-        print(f"Error parsing bbox: {e}")
-    return None
-
-
-def save_detection_image(source_path, bbox_coords, label, color, prefix):
-    """Save a detection image with optional bounding box. Returns the web-accessible path."""
-    detection_filename = f"{prefix}_{int(time.time())}.jpg"
-    detection_dest = os.path.join(DETECTION_DIR, detection_filename)
-    if bbox_coords:
-        img_with_bbox = draw_bounding_box(source_path, bbox_coords, label, color)
-        if isinstance(img_with_bbox, str):
-            shutil.copy(source_path, detection_dest)
-        else:
-            cv2.imwrite(detection_dest, img_with_bbox)
-    else:
-        shutil.copy(source_path, detection_dest)
-    return f"/detections/{detection_filename}"
-
-
-# =========================
-# BUILD ENHANCED GEMINI PROMPT (with CV evidence)
-# =========================
-def build_analysis_prompt(num_images, frame_analyses):
-    """Build a detailed Gemini prompt that includes structured CV evidence from YOLO + Face analysis."""
-
-    # --- Per-frame CV evidence ---
-    cv_evidence = ""
-    total_phone_frames = sum(1 for f in frame_analyses if f["phone_detected"])
-    total_bag_frames = sum(1 for f in frame_analyses if f["bag_detected"])
-    total_book_frames = sum(1 for f in frame_analyses if f["book_detected"])
-    person_counts = [f["person_count"] for f in frame_analyses]
-
-    eyes_closed_frames = 0
-    head_drooping_frames = 0
-
-    for i, fa in enumerate(frame_analyses):
-        cv_evidence += f"\nFrame {i+1} (at {fa['timestamp']}s):\n"
-
-        # YOLO detections
-        if fa['yolo_detections']:
-            for det in fa['yolo_detections']:
-                bbox = det['bbox']
-                cv_evidence += f"  YOLO: {det['class_name']} (conf={det['confidence']:.0%}, pixel_bbox=[{bbox[0]},{bbox[1]},{bbox[2]},{bbox[3]}])\n"
-        else:
-            cv_evidence += "  YOLO: No relevant objects detected\n"
-
-        cv_evidence += f"  Persons in frame: {fa['person_count']}\n"
-
-        # Face analysis (advanced: EAR + blendshapes + solvePnP + MAR)
-        if fa['face_analysis']['faces_detected'] > 0:
-            for j, face in enumerate(fa['face_analysis']['face_analyses']):
-                cv_evidence += f"  Face {j+1}: eyes={face['eye_status']}"
-                if face['ear_avg'] is not None:
-                    cv_evidence += f" (EAR={face['ear_avg']})"
-                if face.get('blink_score') is not None:
-                    cv_evidence += f" [blink_score={face['blink_score']}]"
-                cv_evidence += f", gaze={face.get('gaze_direction', '?')}"
-                if face.get('head_pitch_deg') is not None:
-                    cv_evidence += f", head_pose(pitch={face['head_pitch_deg']}deg, yaw={face['head_yaw_deg']}deg, roll={face.get('head_roll_deg', 0)}deg)"
-                else:
-                    cv_evidence += f", head_pitch={face['head_pitch']}, head_yaw={face['head_yaw']}"
-                if face.get('yawn_status') and face['yawn_status'] != 'NOT_YAWNING':
-                    cv_evidence += f", YAWNING(MAR={face.get('mar')})"
-                if face.get('jaw_open_score') and face['jaw_open_score'] > 0.3:
-                    cv_evidence += f", jaw_open={face['jaw_open_score']}"
-                cv_evidence += "\n"
-
-                if face['eye_status'] in ['CLOSED', 'PARTIALLY_CLOSED']:
-                    eyes_closed_frames += 1
-                if face.get('head_pitch') == 'drooping' or (face.get('head_pitch_deg') is not None and face['head_pitch_deg'] < -15):
-                    head_drooping_frames += 1
-        else:
-            cv_evidence += "  Face: No faces detected by CV\n"
-
-    # --- Temporal summary ---
-    person_count_timeline = ", ".join([f"{fa['timestamp']}s:{fa['person_count']}" for fa in frame_analyses])
-
-    temporal_summary = f"""
-================================================================================
-TEMPORAL / CROSS-FRAME SUMMARY (from computer vision)
-================================================================================
-- Phone detected by YOLO in {total_phone_frames}/{num_images} frames
-- Bag/backpack detected in {total_bag_frames}/{num_images} frames
-- Book/writing material detected in {total_book_frames}/{num_images} frames
-- Eyes closed/partially closed in {eyes_closed_frames} face detections across all frames
-- Head drooping in {head_drooping_frames} face detections across all frames
-- Person count range: {min(person_counts) if person_counts else 0} to {max(person_counts) if person_counts else 0}
-- Person count timeline: [{person_count_timeline}]
-"""
-
-    return f"""
-You are an expert railway safety monitoring system. You are analyzing {num_images} SEQUENTIAL images from a locomotive cab (train driver cabin) CCTV camera.
-
-These images show loco pilots (LP = Loco Pilot, ALP = Assistant Loco Pilot) during their duty.
-Images are numbered 1 to {num_images} in chronological order.
-
-IMPORTANT: Each image has YOLO object-detection bounding boxes DRAWN on it:
-  - GREEN boxes = detected persons
-  - RED boxes = detected cell phones
-  - MAGENTA boxes = detected bags/backpacks
-  - ORANGE boxes = detected books/laptops
-Use these visual annotations as evidence alongside your own analysis.
-
-================================================================================
-COMPUTER VISION PRE-ANALYSIS DATA (YOLO + Face Mesh Analysis)
-================================================================================
-{cv_evidence}
-{temporal_summary}
-
-================================================================================
-ANALYSIS INSTRUCTIONS
-================================================================================
-1. CROSS-VALIDATE: Use BOTH the CV pre-analysis data above AND your own visual analysis
-   of the images. If YOLO detects a phone but you don't see one, note the discrepancy.
-   If you see something YOLO missed, still report it.
-
-2. TEMPORAL PATTERNS matter:
-   - Phone in 1 frame = possibly false positive. In 3+ frames = confirmed usage.
-   - Person count dropping across several frames = someone left.
-   - Eyes closed in multiple consecutive frames = napping. Single frame = blinking.
-
-3. Be STRICT: Only report OBSERVED if you have strong evidence.
-
-4. For bounding boxes in your response, use 0-1000 normalized coordinates.
-
-================================================================================
-ANALYZE THESE 9 SAFETY PARAMETERS
-================================================================================
-
-1. CREW ALERTNESS
-   - Use EAR data: EAR < 0.20 = eyes closed, 0.20-0.25 = drowsy, > 0.25 = alert
-   - Use head_pitch: "drooping" = low alertness, "upright" = alert
-   - Also visually check: posture, engagement with controls, active track scanning
-
-2. CREW DISTRACTION
-   - Use head_yaw: "turned_left/right" = not looking at track
-   - Visually check: looking at non-operational items, turned away, animated gesturing
-
-3. CREW DOING WRITING WORK
-   - Check YOLO "book" detections
-   - Visually check: pen in hand, paper/logbook on desk, writing posture, looking down at document
-
-4. CREW TAKING NAP / MICRO-SLEEP
-   - Use EAR data: consistent EAR < 0.20 across multiple frames = napping
-   - Use head_pitch: "drooping" in multiple frames
-   - Visually check: eyes fully closed, slumped, head resting on surface
-   - NEED multi-frame evidence, not single eye blink
-
-5. CREW USING MOBILE
-   - Check YOLO "cell_phone" detections with confidence scores
-   - Visually check: rectangular device in hand, screen glow, phone posture
-   - CROSS-VALIDATE: YOLO + visual confirmation = high confidence
-
-6. CREW PACKING BELONGINGS
-   - Check YOLO "backpack"/"handbag"/"suitcase" detections
-   - Visually check: actively handling bags, organizing items
-   - Bags visible but stationary = normal. Actively handled = packing.
-
-7. CREW LEAVING PLACE
-   - Check person count changes across frames (timeline provided above)
-   - Visually check: empty seats, person standing/moving toward exit
-
-8. CREW OPERATING HORN LEVER/SWITCH
-   - Visually check: Is any crew member reaching for, pressing, or operating the horn lever/switch?
-   - The horn lever is typically located on the upper portion of the control panel/console
-   - Look for hand on or near the horn lever (pull-down or push-type switch at top of cab console)
-   - Note: YOLO cannot detect horn levers, rely entirely on visual observation
-
-9. LP APPLYING A9/SA9 BRAKE AFTER HALT
-   - Visually check: Is the Loco Pilot (LP) applying the A9 or SA9 brake handle?
-   - Look for LP's hand on the brake handle, brake handle in applied/pulled position
-   - The A9/SA9 brake valve is typically a large handle on the left side of the LP's control stand
-   - Check if train appears halted (stationary) and brake is being applied
-   - Note: YOLO cannot detect brake handles, rely entirely on visual observation
-
-================================================================================
-REQUIRED OUTPUT FORMAT — FOLLOW EXACTLY
-================================================================================
-
----ANALYSIS START---
-
-PARAMETER_1_ALERTNESS:
-Description: [Detailed observations referencing specific frames, EAR values, head pose data]
-Status: [HIGH / MODERATE / LOW]
-Detected_Image: [Image number (1-{num_images}) showing most relevant evidence, or NONE]
-BBox: [x_min, y_min, x_max, y_max] or NONE
-Confidence: [HIGH / MEDIUM / LOW]
-Timestamp_Approx: [N/A]
-
----
-
-PARAMETER_2_DISTRACTION:
-Description: [Reference head_yaw data and visual observations]
-Status: [NONE / LOW / MODERATE / HIGH]
-Detected_Image: [Image number or NONE]
-BBox: [x_min, y_min, x_max, y_max] or NONE
-Confidence: [HIGH / MEDIUM / LOW]
-Timestamp_Approx: [N/A]
-
----
-
-PARAMETER_3_WRITING:
-Description: [Reference YOLO book detections and visual writing observations]
-Status: [OBSERVED / NOT_OBSERVED]
-Detected_Image: [Image number or NONE]
-BBox: [x_min, y_min, x_max, y_max] or NONE
-Confidence: [HIGH / MEDIUM / LOW]
-Timestamp_Approx: [N/A]
-
----
-
-PARAMETER_4_NAP_MICROSLEEP:
-Description: [Reference EAR data across frames, head pose, multi-frame patterns]
-Status: [OBSERVED / NOT_OBSERVED]
-Detected_Image: [Image number or NONE]
-BBox: [x_min, y_min, x_max, y_max] or NONE
-Confidence: [HIGH / MEDIUM / LOW]
-Timestamp_Approx: [N/A]
-
----
-
-PARAMETER_5_MOBILE:
-Description: [Reference YOLO cell_phone detections with confidence, cross-validate visually]
-Status: [OBSERVED / NOT_OBSERVED]
-Detected_Image: [Image number or NONE]
-BBox: [x_min, y_min, x_max, y_max] or NONE
-Confidence: [HIGH / MEDIUM / LOW]
-Timestamp_Approx: [N/A]
-
----
-
-PARAMETER_6_PACKING:
-Description: [Reference YOLO bag detections and visual observations]
-Status: [OBSERVED / NOT_OBSERVED]
-Detected_Image: [Image number or NONE]
-BBox: [x_min, y_min, x_max, y_max] or NONE
-Confidence: [HIGH / MEDIUM / LOW]
-Timestamp_Approx: [N/A]
-
----
-
-PARAMETER_7_LEAVING:
-Description: [Reference person count changes across frames]
-Status: [OBSERVED / NOT_OBSERVED]
-Detected_Image: [Image number or NONE]
-BBox: [x_min, y_min, x_max, y_max] or NONE
-Confidence: [HIGH / MEDIUM / LOW]
-Timestamp_Approx: [N/A]
-
----
-
-PARAMETER_8_HORN:
-Description: [Visual observations of horn lever/switch operation]
-Status: [OBSERVED / NOT_OBSERVED]
-Detected_Image: [Image number or NONE]
-BBox: [x_min, y_min, x_max, y_max] or NONE
-Confidence: [HIGH / MEDIUM / LOW]
-Timestamp_Approx: [N/A]
-
----
-
-PARAMETER_9_BRAKE_A9:
-Description: [Visual observations of A9/SA9 brake handle application after halt]
-Status: [OBSERVED / NOT_OBSERVED]
-Detected_Image: [Image number or NONE]
-BBox: [x_min, y_min, x_max, y_max] or NONE
-Confidence: [HIGH / MEDIUM / LOW]
-Timestamp_Approx: [N/A]
-
----
-
-OVERALL_SAFETY_SUMMARY:
-[2-3 sentence overall safety assessment combining all 9 parameters]
-
-RECOMMENDATIONS:
-[Bullet points of safety recommendations based on findings]
-
----ANALYSIS END---
-"""
-
-
-# =========================
-# PARSE GEMINI RESPONSE
-# =========================
-PARAMETER_CONFIG = {
-    "1_ALERTNESS": {
-        "key": "alertness",
-        "label": "Crew Alertness",
-        "icon": "🧠",
-        "bbox_label": "ALERTNESS",
-        "bbox_color": (0, 165, 255),  # Orange
-        "prefix": "alertness",
-    },
-    "2_DISTRACTION": {
-        "key": "distraction",
-        "label": "Crew Distraction",
-        "icon": "👀",
-        "bbox_label": "DISTRACTION",
-        "bbox_color": (0, 140, 255),  # Dark Orange
-        "prefix": "distraction",
-    },
-    "3_WRITING": {
-        "key": "writing",
-        "label": "Crew Doing Writing Work",
-        "icon": "✍️",
-        "bbox_label": "WRITING",
-        "bbox_color": (255, 0, 0),  # Blue
-        "prefix": "writing",
-    },
-    "4_NAP_MICROSLEEP": {
-        "key": "nap",
-        "label": "Crew Taking Nap / Micro-sleep",
-        "icon": "😴",
-        "bbox_label": "NAP/MICROSLEEP",
-        "bbox_color": (0, 0, 255),  # Red
-        "prefix": "nap",
-    },
-    "5_MOBILE": {
-        "key": "mobile",
-        "label": "Crew Using Mobile",
-        "icon": "📱",
-        "bbox_label": "MOBILE PHONE",
-        "bbox_color": (0, 0, 255),  # Red
-        "prefix": "mobile",
-    },
-    "6_PACKING": {
-        "key": "packing",
-        "label": "Crew Packing Belongings",
-        "icon": "🎒",
-        "bbox_label": "PACKING",
-        "bbox_color": (128, 0, 128),  # Purple
-        "prefix": "packing",
-    },
-    "7_LEAVING": {
-        "key": "leaving",
-        "label": "Crew Leaving Place",
-        "icon": "🚪",
-        "bbox_label": "LEAVING",
-        "bbox_color": (128, 0, 128),  # Purple
-        "prefix": "leaving",
-    },
-    "8_HORN": {
-        "key": "horn",
-        "label": "Crew Operating Horn Lever/Switch",
-        "icon": "📯",
-        "bbox_label": "HORN OPERATION",
-        "bbox_color": (0, 200, 200),  # Yellow-ish (Cyan in BGR)
-        "prefix": "horn",
-    },
-    "9_BRAKE_A9": {
-        "key": "brake_a9",
-        "label": "LP Applying A9/SA9 After Halt",
-        "icon": "🛑",
-        "bbox_label": "BRAKE A9/SA9",
-        "bbox_color": (0, 0, 180),  # Dark Red (BGR)
-        "prefix": "brake_a9",
-    },
-}
-
-
-def parse_gemini_response(result_text, person_images):
-    """Parse the structured Gemini response into a dict of parameter results."""
-    parameters = {}
-
-    for param_id, config in PARAMETER_CONFIG.items():
-        param_data = {
-            "key": config["key"],
-            "label": config["label"],
-            "icon": config["icon"],
-            "description": "",
-            "status": "N/A",
-            "confidence": "N/A",
-            "timestamp": "N/A",
-            "image_url": None,
-        }
-
-        # Find the block for this parameter
-        block_pattern = rf'PARAMETER_{param_id}:\s*(.*?)(?=---|$)'
-        block_match = re.search(block_pattern, result_text, re.DOTALL | re.IGNORECASE)
-
-        if block_match:
-            block_text = block_match.group(1)
-
-            # Parse Description
-            desc_match = re.search(r'Description:\s*(.+?)(?=\nStatus:)', block_text, re.DOTALL | re.IGNORECASE)
-            if desc_match:
-                param_data["description"] = desc_match.group(1).strip()
-
-            # Parse Status
-            status_match = re.search(r'Status:\s*(.+)', block_text, re.IGNORECASE)
-            if status_match:
-                param_data["status"] = status_match.group(1).strip()
-
-            # Parse Confidence
-            conf_match = re.search(r'Confidence:\s*(.+)', block_text, re.IGNORECASE)
-            if conf_match:
-                param_data["confidence"] = conf_match.group(1).strip()
-
-            # Parse Timestamp
-            ts_match = re.search(r'Timestamp_Approx:\s*(.+)', block_text, re.IGNORECASE)
-            if ts_match:
-                param_data["timestamp"] = ts_match.group(1).strip()
-
-            # Parse Detected_Image and BBox → save detection image
-            img_match = re.search(r'Detected_Image:\s*(\d+)', block_text, re.IGNORECASE)
-            bbox_match = re.search(r'BBox:\s*(\[[\d,\s]+\]|NONE)', block_text, re.IGNORECASE)
-
-            if img_match:
-                detected_idx = int(img_match.group(1)) - 1
-                if 0 <= detected_idx < len(person_images):
-                    _, source_path = person_images[detected_idx]
-                    bbox_coords = None
-                    if bbox_match:
-                        bbox_coords = parse_bbox(bbox_match.group(1))
-                    param_data["image_url"] = save_detection_image(
-                        source_path, bbox_coords,
-                        config["bbox_label"], config["bbox_color"], config["prefix"]
-                    )
-
-        parameters[config["key"]] = param_data
-
-    # Parse overall summary
-    summary_match = re.search(r'OVERALL_SAFETY_SUMMARY:\s*(.+?)(?=RECOMMENDATIONS:|---ANALYSIS END---|$)',
-                              result_text, re.DOTALL | re.IGNORECASE)
-    overall_summary = summary_match.group(1).strip() if summary_match else ""
-
-    rec_match = re.search(r'RECOMMENDATIONS:\s*(.+?)(?=---ANALYSIS END---|$)',
-                          result_text, re.DOTALL | re.IGNORECASE)
-    recommendations = rec_match.group(1).strip() if rec_match else ""
-
-    return parameters, overall_summary, recommendations
-
-
-# =========================
-# ROUTES
-# =========================
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
-
+    return render_index(request)
 
 @app.post("/analyze")
 async def analyze_video(request: Request, video: UploadFile = File(...)):
-    video_path = f"temp_{video.filename}"
-    with open(video_path, "wb") as f:
-        f.write(await video.read())
-
-    result_text = ""
-    parameters = {}
-    overall_summary = ""
-    recommendations = ""
-    video_info = {
-        "filename": video.filename,
-        "duration": 0,
-        "fps": 0,
-        "analysis_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "frames_analyzed": 0,
-    }
-
+    upload_path = BASE_DIR / f"temp_{int(time.time())}_{video.filename}"
     try:
-        # 1. Extract frames (every 2s, up to 200 for local analysis)
-        frames, fps, duration = extract_frames(video_path)
-        video_info["fps"] = fps
-        video_info["duration"] = duration
-        video_info["frames_analyzed"] = len(frames)
-        print(f"\nExtracted {len(frames)} frames from {duration}s video at {fps} FPS.")
-
-        if not frames:
-            return templates.TemplateResponse("index.html", {
-                "request": request,
-                "result": "No frames could be extracted from the video.",
-                "video_info": video_info,
-            })
-
-        # 2. Run YOLO + MediaPipe on EVERY frame (local, fast)
-        print("=" * 60)
-        print("TIER 1: Running YOLO + MediaPipe Face Analysis on all frames...")
-        print("=" * 60)
-        frame_analyses, annotated_frames = analyze_all_frames(frames)
-        print(f"\nCompleted local CV analysis of {len(frame_analyses)} frames.")
-
-        # Print detection summary
-        phone_frames = sum(1 for f in frame_analyses if f["phone_detected"])
-        bag_frames = sum(1 for f in frame_analyses if f["bag_detected"])
-        book_frames = sum(1 for f in frame_analyses if f["book_detected"])
-        faces_detected = sum(f["face_analysis"]["faces_detected"] for f in frame_analyses)
-        print(f"  Phone: {phone_frames} frames | Bag: {bag_frames} frames | Book: {book_frames} frames")
-        print(f"  Total face detections: {faces_detected} across {len(frame_analyses)} frames")
-
-        # 3. Compute all 7 parameters LOCALLY using rule-based engine
-        print("\n" + "=" * 60)
-        print("TIER 2: Computing parameters from local CV data (rule engine)...")
-        print("=" * 60)
-        parameters, overall_summary, recommendations = compute_parameters_locally(frame_analyses)
-
-        for key, param in parameters.items():
-            status_icon = "🔴" if param["status"] in ["LOW", "OBSERVED"] else "🟢" if param["status"] in ["HIGH", "NOT_OBSERVED", "NONE"] else "🟡"
-            print(f"  {status_icon} {param['label']}: {param['status']} (conf={param['confidence']})")
-
-        # 4. Dense Gemini analysis (every 7 seconds for high accuracy)
-        print("\n" + "=" * 60)
-        print("TIER 3: Dense Gemini analysis (one frame every 7 seconds)...")
-        print("=" * 60)
-        try:
-            parameters, gemini_summary, gemini_recs, gemini_detail = analyze_with_gemini_dense(parameters, frame_analyses)
-            overall_summary = gemini_summary
-            recommendations = gemini_recs
-            result_text = f"Analysis complete. {gemini_detail}"
-            print("Gemini dense analysis complete.")
-        except Exception as e:
-            print(f"Gemini analysis skipped: {e}")
-            result_text = "Local analysis complete. Gemini analysis was not available."
-
-        # Final status summary
-        print("\n" + "=" * 60)
-        print("FINAL RESULTS:")
-        print("=" * 60)
-        for key, param in parameters.items():
-            print(f"  {param['label']}: {param['status']} ({param['confidence']})")
-        print(f"\n{overall_summary}")
-
-    except Exception as e:
-        result_text = f"Error: {str(e)}"
-        import traceback
+        with open(upload_path, "wb") as f:
+            shutil.copyfileobj(video.file, f)
+        parameters, summary, recs, video_info, result_text, pdf_path = run_local_pipeline(str(upload_path), video.filename)
+    except Exception as exc:
         traceback.print_exc()
-
+        parameters, summary, recs, video_info, result_text, pdf_path = {}, "", "", {"filename": video.filename}, f"Error: {exc}", None
     finally:
-        if os.path.exists(video_path):
-            os.remove(video_path)
+        try:
+            upload_path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
-    # Store results for PDF download
-    last_report["parameters"] = parameters
-    last_report["overall_summary"] = overall_summary
-    last_report["recommendations"] = recommendations
-    last_report["video_info"] = video_info
-    last_report["result_text"] = result_text
-
-    return templates.TemplateResponse("index.html", {
-        "request": request,
-        "result": result_text,
+    last_report.update({
         "parameters": parameters,
-        "overall_summary": overall_summary,
-        "recommendations": recommendations,
+        "overall_summary": summary,
+        "recommendations": recs,
         "video_info": video_info,
+        "result_text": result_text,
+        "pdf_path": pdf_path,
     })
-
-
-# =========================
-# PDF REPORT GENERATION
-# =========================
-def strip_emoji(text):
-    """Remove emoji and other non-latin-1 characters for PDF compatibility."""
-    if not text:
-        return text
-    return text.encode('latin-1', 'ignore').decode('latin-1')
-
-
-class CrewReportPDF(FPDF):
-    """Custom PDF class for the crew monitoring report."""
-
-    def header(self):
-        self.set_font("Helvetica", "B", 16)
-        self.set_text_color(30, 64, 175)
-        self.cell(0, 10, "Crew Behavior Monitoring Report", align="C", new_x="LMARGIN", new_y="NEXT")
-        self.set_font("Helvetica", "", 9)
-        self.set_text_color(120, 120, 120)
-        vi = last_report.get("video_info", {})
-        self.cell(0, 5, f"Generated: {vi.get('analysis_time', 'N/A')}   |   File: {vi.get('filename', 'N/A')}   |   Duration: {vi.get('duration', 0)}s   |   Frames Analyzed: {vi.get('frames_analyzed', 0)}", align="C", new_x="LMARGIN", new_y="NEXT")
-        self.line(10, self.get_y() + 2, 200, self.get_y() + 2)
-        self.ln(6)
-
-    def footer(self):
-        self.set_y(-15)
-        self.set_font("Helvetica", "I", 8)
-        self.set_text_color(150, 150, 150)
-        self.cell(0, 10, f"Powered by Gemini AI + YOLO v8 + Face Analysis   |   Page {self.page_no()}/{{nb}}", align="C")
-
-
-def generate_pdf_report():
-    """Generate a PDF report from the last analysis results."""
-    pdf = CrewReportPDF()
-    pdf.alias_nb_pages()
-    pdf.set_auto_page_break(auto=True, margin=20)
-    pdf.add_page()
-
-    parameters = last_report.get("parameters", {})
-    overall_summary = last_report.get("overall_summary", "")
-    recommendations = last_report.get("recommendations", "")
-
-    # Status color map
-    def get_status_colors(key, status):
-        s = status.upper()
-        if s in ["LOW", "DROWSY", "DROWSY_DETECTED"] or ("NAP" in key.upper() and s == "OBSERVED") or ("MOBILE" in key.upper() and s == "OBSERVED"):
-            return (220, 38, 38)  # Red
-        elif s in ["NOT_OBSERVED", "NONE"] or ("ALERTNESS" in key.upper() and s == "HIGH"):
-            return (34, 197, 94)  # Green
-        elif s == "OBSERVED":
-            return (59, 130, 246)  # Blue
-        else:
-            return (245, 158, 11)  # Orange/warning
-
-    # Render each parameter
-    param_num = 0
-    for key, param in parameters.items():
-        param_num += 1
-
-        # Check if we need a new page (leave room for content + possible image)
-        if pdf.get_y() > 220:
-            pdf.add_page()
-
-        # Parameter header bar
-        pdf.set_fill_color(24, 30, 50)
-        pdf.set_text_color(255, 255, 255)
-        pdf.set_font("Helvetica", "B", 11)
-        pdf.cell(0, 8, strip_emoji(f"  #{param_num}  {param.get('icon', '')}  {param.get('label', key)}"), fill=True, new_x="LMARGIN", new_y="NEXT")
-
-        # Status badge
-        status = param.get("status", "N/A")
-        r, g, b = get_status_colors(key, status)
-        pdf.set_font("Helvetica", "B", 10)
-        pdf.set_text_color(r, g, b)
-        pdf.cell(20, 7, "  Status: ", new_x="END")
-        pdf.cell(0, 7, status, new_x="LMARGIN", new_y="NEXT")
-
-        # Description
-        desc = param.get("description", "")
-        if desc:
-            pdf.set_font("Helvetica", "", 9)
-            pdf.set_text_color(60, 60, 60)
-            pdf.multi_cell(0, 5, strip_emoji(desc), new_x="LMARGIN", new_y="NEXT")
-
-        # Confidence & Timestamp
-        pdf.set_font("Helvetica", "I", 8)
-        pdf.set_text_color(130, 130, 130)
-        meta_line = f"Confidence: {param.get('confidence', 'N/A')}"
-        ts = param.get("timestamp", "N/A")
-        if ts and ts != "N/A":
-            meta_line += f"   |   Timestamp: {ts}"
-        pdf.cell(0, 5, meta_line, new_x="LMARGIN", new_y="NEXT")
-
-        # Evidence image (if available)
-        image_url = param.get("image_url", None)
-        if image_url:
-            # Convert web path to filesystem path
-            img_fs_path = image_url.lstrip("/")  # e.g. "detections/alertness_123.jpg"
-            if os.path.exists(img_fs_path):
-                try:
-                    if pdf.get_y() > 210:
-                        pdf.add_page()
-                    pdf.image(img_fs_path, x=15, w=80, h=55)
-                    pdf.ln(2)
-                except Exception as e:
-                    print(f"Error embedding image {img_fs_path}: {e}")
-
-        # Spacing between parameters
-        pdf.ln(4)
-        pdf.set_draw_color(200, 200, 200)
-        pdf.line(10, pdf.get_y(), 200, pdf.get_y())
-        pdf.ln(4)
-
-    # Overall Safety Summary
-    if overall_summary:
-        if pdf.get_y() > 230:
-            pdf.add_page()
-        pdf.set_fill_color(15, 23, 42)
-        pdf.set_text_color(255, 255, 255)
-        pdf.set_font("Helvetica", "B", 12)
-        pdf.cell(0, 8, "  Overall Safety Assessment", fill=True, new_x="LMARGIN", new_y="NEXT")
-        pdf.set_font("Helvetica", "", 9)
-        pdf.set_text_color(50, 50, 50)
-        pdf.ln(2)
-        pdf.multi_cell(0, 5, strip_emoji(overall_summary), new_x="LMARGIN", new_y="NEXT")
-        pdf.ln(4)
-
-    # Recommendations
-    if recommendations:
-        if pdf.get_y() > 230:
-            pdf.add_page()
-        pdf.set_fill_color(15, 23, 42)
-        pdf.set_text_color(255, 255, 255)
-        pdf.set_font("Helvetica", "B", 12)
-        pdf.cell(0, 8, "  Recommendations", fill=True, new_x="LMARGIN", new_y="NEXT")
-        pdf.set_font("Helvetica", "", 9)
-        pdf.set_text_color(50, 50, 50)
-        pdf.ln(2)
-        pdf.multi_cell(0, 5, strip_emoji(recommendations), new_x="LMARGIN", new_y="NEXT")
-
-    # Save and return path
-    pdf_path = os.path.join(DETECTION_DIR, "crew_monitoring_report.pdf")
-    pdf.output(pdf_path)
-    return pdf_path
-
+    return render_index(
+        request,
+        result=result_text,
+        parameters=parameters,
+        overall_summary=summary,
+        recommendations=recs,
+        video_info=video_info,
+    )
 
 @app.get("/download-report")
 async def download_report():
-    """Generate and download the PDF report for the last analysis."""
-    if not last_report.get("parameters"):
-        return HTMLResponse("<h3>No analysis available. Please analyze a video first.</h3>", status_code=400)
-    pdf_path = generate_pdf_report()
+    pdf_path = last_report.get("pdf_path")
+    if not pdf_path or not os.path.exists(pdf_path):
+        return HTMLResponse("<h3>No report available. Analyze a video first.</h3>", status_code=400)
     vi = last_report.get("video_info", {})
-    filename = f"crew_report_{vi.get('filename', 'video').rsplit('.', 1)[0]}.pdf"
+    filename = f"crew_report_{Path(vi.get('filename', 'video')).stem}.pdf"
     return FileResponse(pdf_path, media_type="application/pdf", filename=filename)
 
-
-# =========================
-# RUN
-# =========================
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
