@@ -1741,8 +1741,6 @@ def run_vlm_on_event(candidate, frame_analyses):
     input_tokens = int(inputs.input_ids.shape[1])
     PROFILER.stop({'behavior': candidate.behavior, 'images': len(images), 'input_tokens': input_tokens, 'dense': bool(candidate.metadata.get('dense_frames'))})
     PROFILER.start('vlm_generate', sync_cuda=True)
-    torch.manual_seed(42)
-    torch.cuda.manual_seed_all(42)
     with torch.inference_mode():
         out_ids = vlm_model.generate(**inputs, max_new_tokens=VLM_MAX_TOKENS, do_sample=False)
     gen = out_ids[:, inputs.input_ids.shape[1]:]
@@ -2356,23 +2354,6 @@ def _reset_runtime_dirs():
         os.makedirs(d, exist_ok=True)
 
 
-def _preprocess_video(video_path: str) -> str:
-    """Fix broken H.264 metadata using ffmpeg stream-copy so frame seeking is deterministic."""
-    import subprocess
-    fixed_path = video_path + '_fixed.mp4'
-    try:
-        result = subprocess.run(
-            ['ffmpeg', '-y', '-fflags', '+genpts+igndts', '-i', video_path,
-             '-c', 'copy', '-avoid_negative_ts', 'make_zero', fixed_path],
-            capture_output=True, timeout=300
-        )
-        if result.returncode == 0 and os.path.exists(fixed_path) and os.path.getsize(fixed_path) > 0:
-            print(f'  Video metadata fixed → using {os.path.basename(fixed_path)}')
-            return fixed_path
-    except Exception as e:
-        print(f'  ffmpeg fix skipped ({e}); using original')
-    return video_path
-
 def run_local_pipeline(video_path: str, video_filename: str):
     global PROFILER
     _reset_runtime_dirs()
@@ -2381,7 +2362,6 @@ def run_local_pipeline(video_path: str, video_filename: str):
 
     print("=" * 60)
     print("STEP 1: Frame extraction")
-    video_path = _preprocess_video(video_path)
     frames, fps, duration = extract_frames(video_path)
 
     print("=" * 60)
