@@ -24,7 +24,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
-COPY main.py .
+COPY main3.py main.py
 COPY templates/ templates/
 
 # Copy YOLO model weights
