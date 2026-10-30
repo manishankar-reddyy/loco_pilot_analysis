@@ -13,6 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxext6 \
     libxrender1 \
     libgomp1 \
+    ffmpeg \
     wget \
     && rm -rf /var/lib/apt/lists/*
 
@@ -23,12 +24,14 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
-COPY main3.py main.py
+# Copy application code (package + ASGI entry point)
+COPY loco_monitor/ loco_monitor/
+COPY server.py .
 COPY templates/ templates/
 
-# Copy YOLO model weights
+# Copy model weights (face landmarker baked in so startup needs no internet)
 COPY brake_horn_detection.pt .
+COPY face_landmarker.task .
 
 # Pre-download YOLO base model so first run is faster
 RUN python -c "from ultralytics import YOLO; YOLO('yolov8s.pt')" 2>/dev/null || true
@@ -48,4 +51,4 @@ HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/')" || exit 1
 
 # Start the application
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000"]
