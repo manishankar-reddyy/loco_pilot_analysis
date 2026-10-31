@@ -1016,7 +1016,7 @@ def compute_parameters_locally(frame_analyses):
     if pst=='OBSERVED': issues.append('packing belongings')
     if hst=='OBSERVED': issues.append('horn operation')
     if bst=='OBSERVED': issues.append('brake A9 applied')
-    summary = (f'Flagged {len(issues)} concern(s): {', '.join(issues)}. Review recommended.'
+    summary = (f'Flagged {len(issues)} concern(s): {", ".join(issues)}. Review recommended.'
                if issues else f'Safe behaviour. Alertness={ast}. No violations.')
     recs=[]
     if ast!='HIGH': recs.append(f'- Monitor alertness (PERCLOS={perclos:.0%}).')
