@@ -87,7 +87,9 @@ PROFILE_DIR   = str(BASE_DIR / 'profiles')
 for d in [FRAME_DIR, ANNOTATED_DIR, DETECTION_DIR, CROP_DIR, PROFILE_DIR]:
     os.makedirs(d, exist_ok=True)
 
-MAX_FRAMES        = 200
+# Notebook default was 200 (stretches the interval on long videos). Raised so a 1h47m video
+# (6420s) is still sampled every SAMPLE_INTERVAL=4s -> 1605 frames. Override with env MAX_FRAMES.
+MAX_FRAMES        = int(os.getenv('MAX_FRAMES', '2000'))
 SAMPLE_INTERVAL   = 4
 END_DENSE_SECONDS = 8
 KEEP_FRAMES_IN_MEMORY = True
@@ -504,9 +506,13 @@ def _extract_frames_decord(video_path):
     dur = total // fps
     sample_secs, ivl = _sample_seconds(dur)
     frame_ids = [min(total-1, int(s*fps)) for s in sample_secs]
-    rgb_batch = vr.get_batch(frame_ids).asnumpy()
+    # decode in chunks so peak RAM is not doubled for long videos (same frames, same order)
+    def _iter_rgb(chunk=64):
+        for k in range(0, len(frame_ids), chunk):
+            for rgb in vr.get_batch(frame_ids[k:k + chunk]).asnumpy():
+                yield rgb
     frames = []
-    for sec, rgb in zip(sample_secs, rgb_batch):
+    for sec, rgb in zip(sample_secs, _iter_rgb()):
         bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
         p = f'{FRAME_DIR}/frame_{sec}.jpg'
         if WRITE_EXTRACTED_FRAMES:
@@ -1828,7 +1834,7 @@ def _preprocess_video(video_path: str) -> str:
         result = subprocess.run(
             ['ffmpeg', '-y', '-fflags', '+genpts+igndts', '-i', video_path,
              '-c', 'copy', '-avoid_negative_ts', 'make_zero', fixed_path],
-            capture_output=True, timeout=300
+            capture_output=True, timeout=3600
         )
         if result.returncode == 0 and os.path.exists(fixed_path) and os.path.getsize(fixed_path) > 0:
             print(f'  Video metadata fixed → using {os.path.basename(fixed_path)}')
@@ -2012,10 +2018,11 @@ async def analyze_video(request: Request, video: UploadFile = File(...)):
         traceback.print_exc()
         parameters, summary, recs, video_info, result_text, pdf_path = {}, "", "", {"filename": video.filename}, f"Error: {exc}", None
     finally:
-        try:
-            upload_path.unlink(missing_ok=True)
-        except Exception:
-            pass
+        for _tmp in (upload_path, Path(str(upload_path) + '_fixed.mp4')):
+            try:
+                _tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
 
     last_report.update({
         "parameters": parameters,
