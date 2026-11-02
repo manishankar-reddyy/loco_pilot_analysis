@@ -112,8 +112,8 @@ DENSE_EVENT_FPS = 1
 DENSE_EVENT_BEHAVIORS = {'writing', 'nap', 'alertness', 'distraction', 'attention_state'}
 
 FUSION_THRESHOLDS = {
-    'mobile': 0.62, 'writing': 0.48, 'packing': 0.62, 'leaving': 0.65,
-    'nap': 0.62, 'distraction': 0.58, 'horn': 0.55, 'brake_a9': 0.55,
+    'mobile': 0.62, 'writing': 0.6, 'packing': 0.62, 'leaving': 0.65,
+    'nap': 0.62, 'distraction': 0.58, 'horn': 0.7, 'brake_a9': 0.7,
 }
 GROUND_TRUTH_JSON = None
 
